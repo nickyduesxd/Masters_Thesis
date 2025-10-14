@@ -27,17 +27,15 @@ EARTH_ORBIT_ALTITUDE = 35786.0 # Geostationary Orbit (GEO)
 MARS_ORBIT_ALTITUDE = 17034.0 # Mars synchronous orbit (Areostationary)
 #FSO Communication ranges
 CONTROLLER_RANGE = 0.3 * AU  # Earth-Moon system coverage 
-RELAY_RANGE = 4.0 * AU  # Deep space relay 
+RELAY_RANGE = 1.0 * AU  # Deep space relay 
 #FSO Communication System Constants
 FSO_WAVELENGTH = 1550e-9  #1550nm
-FSO_BEAM_DIVERGENCE = 10e-6  #10 microradian beam divergence, realistic beam divergense 
+FSO_BEAM_DIVERGENCE = 30e-6  #30 microradian beam divergence, realistic beam divergence 
 FSO_TRANSMIT_POWER = 100.0  #Watts, realistic power
-FSO_APERTURE_DIAMETER = 0.3  #Meters - telescope aperture - opening that allows a telescope to collect light - can possibly make bigger
+FSO_APERTURE_DIAMETER = 1.0  #Meters - telescope aperture - opening that allows a telescope to collect light - can possibly make bigger
 FSO_POINTING_ACCURACY = 10e-6  # 10 microradian pointing accuracy, realistic pointing accuracy
-FSO_ACQUISITION_TIME = 300.0  # 300 seconds beam acquisition time
+FSO_ACQUISITION_TIME = 1800.0  # 30 minutes beam acquisition time
 FSO_DATA_RATE_BASELINE = 1e9  # 1 Gbps baseline data rate
-#Atmospheric losses for Earth only 
-ATMOSPHERIC_LOSS_DB = 10.0  # 10dB loss through Earth atmosphere - Signal attenuation through atmosphere due to weather, etc.
 #FSO Link Quality Levels
 FSO_LINK_EXCELLENT = 0.95 
 FSO_LINK_GOOD = 0.85      
@@ -48,12 +46,12 @@ QOS_PRIORITY_LEVELS = ['EMERGENCY', 'CRITICAL', 'HIGH', 'NORMAL', 'LOW']
 #Number of satellites
 EARTH_SATS = 8
 MARS_SATS = 4
-EARTH_MOON_CONTROLLERS = 4
+EARTH_MOON_CONTROLLERS = 3
 EARTH_SUN_RELAYS = 4
 MARS_SUN_RELAYS = 4
 #Simulation parameters
 SIM_DURATION = 20000 #roughly 2.25 years
-SIM_STEP = 1.0 #1 hrs
+SIM_STEP = 0.25 # 15 minutes
 # Navigation and Coordination Constants
 NAVIGATION_UPDATE_INTERVAL = 0.1  #6 minutes between navigation updates
 PREDICTION_HORIZON = 2.0  #Number of hours ahead to predict positions
@@ -62,10 +60,11 @@ COORDINATION_RANGE = 0.5 * AU  #Range for controller coordination
 #Traffic Management Constants
 TRAFFIC_UPDATE_INTERVAL = 0.05  #Hours between traffic updates (3 minutes)
 TRANSMISSION_SLOT_DURATION = 0.02  #Hours per transmission slot (1.2 minutes)
-#Solar exclusion zone to account for sun's corona effects on lasers
-SOLAR_EXCLUSION_RADIUS = SUN_RADIUS * 1.5
+#Solar exclusion zone to account for sun's corona effects on lasers - estimate
+SOLAR_EXCLUSION_RADIUS = SUN_RADIUS * 5
 
-#The main satellite object that manages position and velocity in 3D space, handles FSO terminal operations, performs orbital mechanics calculations, manages network connections and coordinates with controllers for traffic management.
+#The main satellite object that manages position and velocity in 3D space, handles FSO terminal operations, performs orbital mechanics calculations, 
+#manages network connections and coordinates with controllers for traffic management.
 class Satellite:
     def __init__(self, sat_id, planet, orbit_altitude, inclination, phase, sat_type='satellite', lagrange_point=None, color='blue'):
         self.sat_id = sat_id
@@ -103,24 +102,181 @@ class Satellite:
         self.fso_terminal = FSO_Terminal(sat_id, aperture_size, laser_power)
         self.orbital_mechanics = RealisticOrbitalMechanics()
         if sat_type == 'relay':
-            self.simultaneous_links_max = 50
+            self.simultaneous_links_max = 10#50
         elif sat_type == 'controller':
-            self.simultaneous_links_max = 12 
+            self.simultaneous_links_max = 4#12 
         else:
-            self.simultaneous_links_max = 8
+            self.simultaneous_links_max = 2#8
         self.ephemeris = RealEphemerisData()
         if sat_type in ['controller', 'relay'] and lagrange_point:
             self.ephemeris = RealEphemerisData()
             self.lagrange_calculator = PreciseLagrangePoints(self.ephemeris)
     
+    def debug_position_evolution(self, time, step_number):
+        if self.planet not in ['Earth', 'Mars'] or step_number > 10:
+            return
+        
+        angle = np.arctan2(self.position[1], self.position[0]) * 180 / np.pi
+        angle = angle % 360  #Normalize to 0-360
+        radius = np.linalg.norm(self.position)
+        
+        #Calculate expected angle based on orbital motion
+        if self.planet == 'Earth':
+            orbital_period = 24.0
+        else:
+            orbital_period = 24.6
+            
+        angular_velocity = 360.0 / orbital_period  # in degrees per hour
+        expected_angle = (self.phase * 180 / np.pi + angular_velocity * time) % 360
+    
+        print(f"  {self.sat_id} step {step_number}: actual={angle:.1f}°, expected={expected_angle:.1f}°, radius={radius:.0f}km")
+        
+        #Check if motion is reasonable
+        if step_number > 1:
+            angle_change = abs(angle - getattr(self, '_last_debug_angle', angle))
+            if angle_change < 0.1:  # Less than 0.1 degree change
+                print(f"    WARNING: {self.sat_id} appears stationary (angle change: {angle_change:.3f}°)")
+        
+        self._last_debug_angle = angle
+
+    def _update_simple_circular_orbit(self, time, dt):
+        if self.planet == 'Earth':
+            orbital_period = 24.0  # in hours
+            orbit_radius = EARTH_RADIUS + self.orbit_altitude #km
+            central_mu = 398600.4418e9  #Earth GM 
+        elif self.planet == 'Mars':
+            orbital_period = 24.6  #hours  
+            orbit_radius = MARS_RADIUS + self.orbit_altitude #km
+            central_mu = 42828.37e9  #Mars GM 
+        else:
+            return
+
+        #Calculate angular velocity (rad/hr)
+        angular_velocity = 2 * np.pi / orbital_period
+    
+        #Initialize and update orbital time
+        if not hasattr(self, '_orbital_time'):
+            self._orbital_time = 0.0
+        self._orbital_time += (dt if dt else SIM_STEP)
+    
+        #calculate current orbital angle
+        current_phase = (self.phase + angular_velocity * self._orbital_time) % (2 * np.pi)
+    
+        #calculate position in simple orbital plane (km)
+        x_orbital = orbit_radius * np.cos(current_phase)
+        y_orbital = orbit_radius * np.sin(current_phase)
+    
+        #Apply inclination - rotate around x-axis
+        z_orbital = y_orbital * np.sin(self.inclination)
+        y_orbital = y_orbital * np.cos(self.inclination)
+    
+        #apply RAAN rotation (rotate around z-axis)
+        cos_raan = np.cos(self.raan)
+        sin_raan = np.sin(self.raan)
+    
+        planet_relative_position = np.array([
+            x_orbital * cos_raan - y_orbital * sin_raan,
+            x_orbital * sin_raan + y_orbital * cos_raan,
+            z_orbital
+        ])
+    
+        #Get planet's current heliocentric position
+        if self.planet == 'Earth':
+            planet_position = self.ephemeris.get_earth_position(time)
+        elif self.planet == 'Mars':
+            planet_position = self.ephemeris.get_mars_position(time)
+    
+        #Transform to heliocentric coordinates
+        self.position = planet_position + planet_relative_position
+    
+        #Calculate orbital velocity (km/s)
+        orbital_speed = np.sqrt(central_mu / (orbit_radius * 1000)) / 1000
+    
+        #Velocity in orbital plane
+        vx_orbital = -orbital_speed * np.sin(current_phase)
+        vy_orbital = orbital_speed * np.cos(current_phase)
+    
+        #Apply inclination to velocity
+        vz_orbital = vy_orbital * np.sin(self.inclination)
+        vy_orbital = vy_orbital * np.cos(self.inclination)
+    
+        #Apply RAAN rotation to velocity
+        planet_relative_velocity = np.array([
+            vx_orbital * cos_raan - vy_orbital * sin_raan,
+            vx_orbital * sin_raan + vy_orbital * cos_raan,
+            vz_orbital
+        ])
+    
+        #Add planet's velocity
+        if hasattr(self, '_last_planet_pos') and hasattr(self, '_last_time'):
+            dt_hours = time - self._last_time
+            if dt_hours > 0:
+                planet_velocity = (planet_position - self._last_planet_pos) / (dt_hours * 3600)  # km/s
+            else:
+                planet_velocity = np.zeros(3)
+        else:
+            planet_velocity = np.zeros(3)
+    
+        self.velocity = planet_velocity + planet_relative_velocity
+    
+        #store for next iteration
+        self._last_planet_pos = planet_position.copy()
+        self._last_time = time
+        self.last_update_time = time
+    
+        #DEBUG verification
+        actual_orbit_radius = np.linalg.norm(planet_relative_position)
+        satellite_angle = np.arctan2(planet_relative_position[1], planet_relative_position[0]) * 180 / np.pi % 360
+    
+        print(f"DEBUG: {self.sat_id} - Phase: {current_phase*180/np.pi:.1f}°, "
+              f"Orbit radius: {actual_orbit_radius:.0f}km, "
+            f"Angle: {satellite_angle:.1f}°")
+        if abs(actual_orbit_radius - orbit_radius) > 100:
+            print(f"ERROR: {self.sat_id} orbital radius wrong! Expected {orbit_radius:.0f}, got {actual_orbit_radius:.0f}")
+
+    def debug_update_path(self, time, dt):
+        print(f"DEBUG PATH: {self.sat_id} - sat_type={self.sat_type}, planet={self.planet}")
+    
+        if self.sat_type in ['controller', 'relay'] and hasattr(self, 'lagrange_calculator'):
+            print(f"DEBUG PATH: {self.sat_id} taking LAGRANGE path")
+            return "lagrange"
+        elif self.planet in ['Earth', 'Mars']:
+            print(f"DEBUG PATH: {self.sat_id} taking ORBITAL path")
+            return "orbital"
+        else:
+            print(f"DEBUG PATH: {self.sat_id} taking PERTURBATION path")
+            return "perturbation"
+
+
     #Update satellite position using realistic orbital mechanics
     def update_position_with_orbital_perturbations(self, time, ticks, dt=None):
+        path_taken = self.debug_update_path(time, dt)
         if dt is None:
             dt = SIM_STEP  #in hours
         if self.sat_type in ['controller', 'relay'] and hasattr(self, 'lagrange_calculator'):
             self.position = self._get_precise_lagrange_position(time)
+            self.velocity = np.array([0, 0, 0])
             return
+
+        if self.planet in ['Earth', 'Mars']:
+            self._update_simple_circular_orbit(time, dt)
+            return
+        # DEBUG: Check initial state before integration
+        if time < 24:  # Only for first day
+            print(f"DEBUG {self.sat_id} BEFORE integration:")
+            print(f"  Position: {self.position}")
+            print(f"  Distance from origin: {np.linalg.norm(self.position):.0f} km")
     
+        # CHECK: Are we accidentally using planetary ephemeris data?
+        if self.planet == 'Earth' and np.linalg.norm(self.position) > 1e6:  # More than 1 million km
+            print(f"ERROR: {self.sat_id} is at interplanetary distance!")
+            print(f"  Position: {self.position}")
+            print(f"  This satellite should be in Earth orbit, not interplanetary space!")
+        
+            # Emergency reset to proper Earth orbit
+            self._initialize_orbital_state()
+            return
+
         #metric conversion
         state = np.concatenate([
             self.position * 1000,  #km to m
@@ -153,34 +309,42 @@ class Satellite:
     #Get precise Lagrange point position using PreciseLagrangePoints calculator
     def _get_precise_lagrange_position(self, time_hours):
         if not hasattr(self, 'lagrange_calculator') or not self.lagrange_point:
-            return np.array([0, 0, 0])
-    
-        #map lagrange_point string to calculator method
-        lagrange_methods = {
-        'Earth-Moon-L1': self.lagrange_calculator.earth_moon_l1,
-        'Earth-Moon-L2': self.lagrange_calculator.earth_moon_l2,
-        #'Earth-Moon-L3': self.lagrange_calculator.earth_moon_l3,
-        'Earth-Moon-L4': self.lagrange_calculator.earth_moon_l4,
-        'Earth-Moon-L5': self.lagrange_calculator.earth_moon_l5,
-        'Earth-Sun-L1': self.lagrange_calculator.earth_sun_l1,
-        'Earth-Sun-L2': self.lagrange_calculator.earth_sun_l2,
-        #'Earth-Sun-L3': self.lagrange_calculator.earth_sun_l3,
-        'Earth-Sun-L4': self.lagrange_calculator.earth_sun_l4,
-        'Earth-Sun-L5': self.lagrange_calculator.earth_sun_l5,
-        'Mars-Sun-L1': self.lagrange_calculator.mars_sun_l1,
-        'Mars-Sun-L2': self.lagrange_calculator.mars_sun_l2,
-        #'Mars-Sun-L3': self.lagrange_calculator.mars_sun_l3,
-        'Mars-Sun-L4': self.lagrange_calculator.mars_sun_l4,
-        'Mars-Sun-L5': self.lagrange_calculator.mars_sun_l5,
-        }
-    
-        if self.lagrange_point in lagrange_methods:
-            return lagrange_methods[self.lagrange_point](time_hours)
-        else:
-            print(f"Warning: Unknown Lagrange point {self.lagrange_point}")
+            print(f"WARNING: {self.sat_id} missing lagrange_calculator or lagrange_point")
             return np.array([0, 0, 0])
 
-    #Enhanced controller coordination with navigation services and traffic management
+        # Map lagrange_point string to calculator method
+        lagrange_methods = {
+            'Earth-Moon-L1': self.lagrange_calculator.earth_moon_l1,
+            'Earth-Moon-L2': self.lagrange_calculator.earth_moon_l2,
+            'Earth-Moon-L3': self.lagrange_calculator.earth_moon_l3,
+            'Earth-Moon-L4': self.lagrange_calculator.earth_moon_l4,
+            'Earth-Moon-L5': self.lagrange_calculator.earth_moon_l5,
+            'Earth-Sun-L1': self.lagrange_calculator.earth_sun_l1,
+            'Earth-Sun-L2': self.lagrange_calculator.earth_sun_l2,
+            'Earth-Sun-L4': self.lagrange_calculator.earth_sun_l4,
+            'Earth-Sun-L5': self.lagrange_calculator.earth_sun_l5,
+            'Mars-Sun-L1': self.lagrange_calculator.mars_sun_l1,
+            'Mars-Sun-L2': self.lagrange_calculator.mars_sun_l2,
+            'Mars-Sun-L4': self.lagrange_calculator.mars_sun_l4,
+            'Mars-Sun-L5': self.lagrange_calculator.mars_sun_l5,
+        }
+
+        if self.lagrange_point in lagrange_methods:
+            try:
+                position = lagrange_methods[self.lagrange_point](time_hours)
+                #debug info for first few time steps
+                if time_hours < 100:  # define first few time steps
+                    distance_from_origin = np.linalg.norm(position)
+                    print(f"DEBUG: {self.sat_id} ({self.lagrange_point}) at {distance_from_origin/1000:.0f} km from origin")
+                return position
+            except Exception as e:
+                print(f"ERROR: Failed to calculate {self.lagrange_point} for {self.sat_id}: {e}")
+                return np.array([0, 0, 0])
+        else:
+            print(f"WARNING: Unknown Lagrange point {self.lagrange_point} for {self.sat_id}")
+            return np.array([0, 0, 0])
+
+    #Controller coordination with navigation services and traffic management
     def perform_controller_coordination(self, all_satellites, current_time):
         if self.sat_type != 'controller':
             return
@@ -188,67 +352,67 @@ class Satellite:
         #Update coordination at regular intervals
         if current_time - self.last_coordination_update < NAVIGATION_UPDATE_INTERVAL:
             return
-        
+    
         self.last_coordination_update = current_time
-        
-        #Find satellites in this controller's "region"
-        self.satellites_in_region = self._find_satellites_in_region(all_satellites)
-        
-        #Update relay ephemeris data
+    
+        #Use the satellites already assigned to this controller by the sector-based assignment
+        if not hasattr(self, 'satellites_in_region'):
+            self.satellites_in_region = []
+    
+        # Update relay ephemeris data
         earth_sun_relays = [sat for sat in all_satellites 
-                           if sat.sat_type == 'relay' and 'Earth-Sun' in str(sat.lagrange_point)]
+                       if sat.sat_type == 'relay' and 'Earth-Sun' in str(sat.lagrange_point)]
         self.navigation_coordinator.update_relay_ephemeris(earth_sun_relays, current_time)
-        
-        #Generate coordination update for navigation + traffic
+    
+        # Generate coordination update for navigation + traffic
         enhanced_update = self.navigation_coordinator.generate_enhanced_coordination_update(
             self.satellites_in_region, current_time
         )
-        
-        #Send updates to satellites in "region"
+    
+        # Send updates to satellites in region
         for satellite in self.satellites_in_region:
-            #Send navigation update
+            # Send navigation update
             if enhanced_update['navigation_data']:
                 satellite.fso_terminal.receive_navigation_update(enhanced_update['navigation_data'])
-            #Send traffic coordination update
+            # Send traffic coordination update
             if enhanced_update['traffic_data']:
                 satellite.fso_terminal.receive_traffic_coordination_update(enhanced_update)
-        #Coordinate handoffs
+    
+        # Coordinate handoffs
         handoff_commands = self.navigation_coordinator.coordinate_handoffs(
-            self.satellites_in_region, current_time
+            self.satellites_in_region, all_satellites, current_time
         )
-        #Log coordination
+    
+        # Log coordination with accurate satellite count
         if len(self.satellites_in_region) > 0:
             traffic_info = ""
             if enhanced_update['traffic_data']:
                 scheduled_transmissions = len([s for s in enhanced_update['traffic_data'].satellite_instructions.values() 
-                                             if s.get('status') != 'QUEUED'])
+                                         if s.get('status') != 'QUEUED'])
                 traffic_info = f", {scheduled_transmissions} transmissions scheduled"
-            
             print(f"    Controller {self.sat_id}: Coordinating {len(self.satellites_in_region)} satellites, "
                   f"{len(handoff_commands)} handoffs planned{traffic_info}")
+        else:
+            print(f"    Controller {self.sat_id}: Coordinating 0 satellites")
+
     #Find Earth satellites in this controller's coverage "region"
     def _find_satellites_in_region(self, all_satellites):
-        satellites_in_region = []
-        
+        satellites_in_region = []        
         for satellite in all_satellites:
             if satellite.planet == 'Earth' and self._is_in_controller_region(satellite):
                 distance = np.linalg.norm(self.position - satellite.position)
                 if distance < COORDINATION_RANGE * 1000:  #Within coordination range
                     satellites_in_region.append(satellite)
-        
         return satellites_in_region
     #Check FSO link feasibility including line-of-sight
     def _can_establish_fso_link(self, other_sat, distance):
         distance_km = distance / 1000 if distance > 1000000 else distance
-        max_range_km = RELAY_RANGE * 149597870.7  # Convert AU to km
-    
+        max_range_km = RELAY_RANGE * 149597870.7  # Convert from AU to km
         #in range?
         if distance_km > max_range_km:
             return False
-    
         current_time = getattr(self, 'last_update_time', 0)
         check_sun = True
-    
         #Earth satellite to Earth-Sun relay - no Sun check needed - relay is positioned to avoid Sun
         if ((self.planet == 'Earth' and other_sat.sat_type == 'relay' and 'Earth-Sun' in str(other_sat.lagrange_point)) or
             (other_sat.planet == 'Earth' and self.sat_type == 'relay' and 'Earth-Sun' in str(self.lagrange_point))):
@@ -261,7 +425,6 @@ class Satellite:
         elif ((self.sat_type == 'controller' and other_sat.sat_type == 'relay' and 'Earth-Sun' in str(other_sat.lagrange_point)) or
           (other_sat.sat_type == 'controller' and self.sat_type == 'relay' and 'Earth-Sun' in str(self.lagrange_point))):
             check_sun = False
-    
         #Check line of sight
         los_clear, blocking_body = LineOfSightChecker.is_line_of_sight_clear(
             self.position, 
@@ -271,10 +434,8 @@ class Satellite:
             check_planets=True,
             check_moon=(self.planet == 'Earth' or other_sat.planet == 'Earth')
         )
-    
         if not los_clear:
             return False
-    
         #Earth-Sun relays can talk to each other
         if (self.sat_type == 'relay' and other_sat.sat_type == 'relay' and
             'Earth-Sun' in str(self.lagrange_point) and 'Earth-Sun' in str(other_sat.lagrange_point)):
@@ -401,7 +562,7 @@ class Satellite:
 
     #Establish controller links to relays and managed satellites
     def _establish_controller_links(self, other_satellites, time):
-        #Priority 1 - Connect to Earth-Sun relays
+        #Connect to Earth-Sun relays
         earth_relays = [s for s in other_satellites 
                        if s.sat_type == 'relay' and 'Earth-Sun' in str(s.lagrange_point)]
         for relay in earth_relays:
@@ -412,8 +573,6 @@ class Satellite:
                         relay.fso_terminal, distance, time)
                     if success:
                         print(f"    CONTROLLER-RELAY: {self.sat_id} -> {relay.sat_id}")
-        
-        #Priority 2 - Accept connections from Earth satellites in region - which is handled by the Earth satellites attempting to connect to us
     
     #Establish links for Mars satellites and relays
     def _establish_other_links(self, other_satellites, time):
@@ -451,35 +610,41 @@ class Satellite:
             if links_attempted >= 3:  #Limit attempts per update
                 break
 
-    #Check if an Earth satellite is in this controller's line of sight region
+    #region assignment based on controller proximity 
     def _is_in_controller_region(self, earth_satellite):
         if self.sat_type != 'controller' or earth_satellite.planet != 'Earth':
             return False
-        
-        controller_angle = np.arctan2(self.position[1], self.position[0])
-        satellite_angle = np.arctan2(earth_satellite.position[1], earth_satellite.position[0])
-        controller_angle = (controller_angle + 2 * np.pi) % (2 * np.pi)
-        satellite_angle = (satellite_angle + 2 * np.pi) % (2 * np.pi)
-        
-        if self.lagrange_point == 'Earth-Moon-L1':
-            region_start = 315 * np.pi / 180
-            region_end = 45 * np.pi / 180
-            return self._angle_in_region(satellite_angle, region_start, region_end)
-        elif self.lagrange_point == 'Earth-Moon-L2':
-            region_start = 135 * np.pi / 180
-            region_end = 225 * np.pi / 180
-            return self._angle_in_region(satellite_angle, region_start, region_end)
-        elif self.lagrange_point == 'Earth-Moon-L4':
-            region_start = 45 * np.pi / 180
-            region_end = 135 * np.pi / 180
-            return self._angle_in_region(satellite_angle, region_start, region_end)
-        elif self.lagrange_point == 'Earth-Moon-L5':
-            region_start = 225 * np.pi / 180
-            region_end = 315 * np.pi / 180
-            return self._angle_in_region(satellite_angle, region_start, region_end)
-        
-        return False
     
+        # Calculate distance between this controller and satellite
+        distance = np.linalg.norm(self.position - earth_satellite.position)
+    
+        # Define coverage radius
+        coverage_radius = 0.5 * AU * 1000  # 0.5 AU in km
+    
+        #is satellite is within this controller's range?
+        if distance >= coverage_radius:
+            return False
+    
+        #store this controller's distance for comparison
+        if not hasattr(earth_satellite, '_controller_distances'):
+            earth_satellite._controller_distances = {}
+    
+        earth_satellite._controller_distances[self.sat_id] = distance
+        return True
+
+    #Check if angle is within region, handling wraparound. All inputs in degrees
+    def _angle_in_region_deg(self, angle, start, end):
+        angle = angle % 360
+        start = start % 360
+        end = end % 360
+    
+        if start <= end:
+            # Normal case: start=45, end=135, check if 45 <= angle <= 135
+            return start <= angle <= end
+        else:
+            # Wraparound case: start=315, end=45, check if angle >= 315 OR angle <= 45
+            return angle >= start or angle <= end
+
     #Check if an angle is within a region, handling wraparound
     def _angle_in_region(self, angle, start, end):
         if start <= end:
@@ -497,7 +662,6 @@ class Satellite:
                 'last_coordination_update': getattr(self, 'last_coordination_update', 0),
                 'coordination_active': hasattr(self, 'navigation_coordinator')
             }
-        
         return {
             'sat_id': self.sat_id,
             'planet': self.planet,
@@ -525,6 +689,148 @@ class Satellite:
             'transmission_schedule': str(fso_stats.get('transmission_schedule', {})),
             **controller_status
         }
+
+class InterControllerCoordinator:
+    def __init__(self):
+        self.scheduling_intentions = {}  # controller_id: SchedulingIntention
+        self.global_relay_assignments = {}  # relay_id: [assignments]
+        self.coordination_round = 0
+        self.consensus_timeout = 0.05  # 3 minutes for consensus
+        
+    #Controllers register their scheduling intentions
+    def register_scheduling_intention(self, controller_id, intention):
+        self.scheduling_intentions[controller_id] = intention
+    
+    #Find overlapping relay assignments
+    def detect_conflicts(self):
+        conflicts = []
+        relay_demands = {}  # relay_id: total_demand
+        
+        # Aggregate demands per relay
+        for controller_id, intention in self.scheduling_intentions.items():
+            for assignment in intention.proposed_assignments:
+                relay_id = assignment['relay_id']
+                if relay_id not in relay_demands:
+                    relay_demands[relay_id] = {'demand': 0, 'controllers': []}
+                relay_demands[relay_id]['demand'] += assignment['capacity_needed']
+                relay_demands[relay_id]['controllers'].append(controller_id)
+        
+        # Check for oversubscription
+        for relay_id, data in relay_demands.items():
+            max_capacity = 100  # Relay max capacity
+            if data['demand'] > max_capacity:
+                conflicts.append({
+                    'relay_id': relay_id,
+                    'demand': data['demand'],
+                    'capacity': max_capacity,
+                    'oversubscription': data['demand'] - max_capacity,
+                    'competing_controllers': data['controllers']
+                })
+        
+        return conflicts
+    
+    #Resolve scheduling conflicts using priority-based allocation
+    def resolve_conflicts(self, conflicts):
+        resolutions = {}   
+        for conflict in conflicts:
+            relay_id = conflict['relay_id']
+            available_capacity = conflict['capacity']
+            competing_controllers = conflict['competing_controllers']
+            
+            # Get all assignments for this relay
+            relay_assignments = []
+            for controller_id in competing_controllers:
+                intention = self.scheduling_intentions[controller_id]
+                for assignment in intention.proposed_assignments:
+                    if assignment['relay_id'] == relay_id:
+                        assignment['controller_id'] = controller_id
+                        relay_assignments.append(assignment)
+            
+            # Sort by priority (emergency first, then by timestamp)
+            relay_assignments.sort(key=lambda x: (
+                -self._get_priority_score(x['priority']),
+                x['timestamp']
+            ))
+            
+            # Allocate capacity in priority order
+            allocated = []
+            rejected = []
+            used_capacity = 0
+            
+            for assignment in relay_assignments:
+                needed = assignment['capacity_needed']
+                if used_capacity + needed <= available_capacity:
+                    allocated.append(assignment)
+                    used_capacity += needed
+                else:
+                    rejected.append(assignment)
+            
+            resolutions[relay_id] = {
+                'allocated': allocated,
+                'rejected': rejected,
+                'utilization': used_capacity / available_capacity
+            }
+        
+        return resolutions
+    
+    #Convert priority to numeric score
+    def _get_priority_score(self, priority):
+        priority_scores = {
+            'EMERGENCY': 100,
+            'CRITICAL': 50,
+            'HIGH': 20,
+            'NORMAL': 10,
+            'LOW': 5
+        }
+        return priority_scores.get(priority, 1)
+    
+    #Generate final coordinated schedule
+    def generate_consensus_schedule(self, resolutions):
+        consensus_schedule = {}
+        controller_updates = {}
+        
+        for relay_id, resolution in resolutions.items():
+            consensus_schedule[relay_id] = resolution['allocated']
+            # Group by controller for notifications
+            for assignment in resolution['allocated']:
+                controller_id = assignment['controller_id']
+                if controller_id not in controller_updates:
+                    controller_updates[controller_id] = {
+                        'approved': [],
+                        'rejected': []
+                    }
+                controller_updates[controller_id]['approved'].append(assignment)
+            
+            for assignment in resolution['rejected']:
+                controller_id = assignment['controller_id']
+                if controller_id not in controller_updates:
+                    controller_updates[controller_id] = {
+                        'approved': [],
+                        'rejected': []
+                    }
+                controller_updates[controller_id]['rejected'].append(assignment)
+        
+        return consensus_schedule, controller_updates
+
+class SchedulingIntention:
+    def __init__(self, controller_id, timestamp):
+        self.controller_id = controller_id
+        self.timestamp = timestamp
+        self.proposed_assignments = []  # List of proposed relay assignments
+        self.priority_breakdown = {'EMERGENCY': 0, 'CRITICAL': 0, 'HIGH': 0, 'NORMAL': 0, 'LOW': 0}
+        
+    def add_assignment(self, satellite_id, relay_id, priority, capacity_needed, start_time, duration):
+        assignment = {
+            'satellite_id': satellite_id,
+            'relay_id': relay_id,
+            'priority': priority,
+            'capacity_needed': capacity_needed,
+            'start_time': start_time,
+            'duration': duration,
+            'timestamp': self.timestamp
+        }
+        self.proposed_assignments.append(assignment)
+        self.priority_breakdown[priority] += 1
 
 #Check line-of-sight between satellites considering celestial body - a laser should not be going through a planet or the sun
 class LineOfSightChecker:
@@ -558,12 +864,10 @@ class LineOfSightChecker:
         mars_pos = LineOfSightChecker._get_mars_position(time)
         sun_pos = np.array([0, 0, 0])  # Sun at origin
         moon_pos = LineOfSightChecker._get_moon_position(time, earth_pos)
-        
         #Check Sun
         if check_sun:
             if LineOfSightChecker.check_line_intersects_sphere(sat1_pos, sat2_pos, sun_pos, SOLAR_EXCLUSION_RADIUS):
                 return False, "Sun"
-        
         if check_planets:
             #Check Earth
             if LineOfSightChecker.check_line_intersects_sphere(sat1_pos, sat2_pos, earth_pos, EARTH_RADIUS):
@@ -577,7 +881,6 @@ class LineOfSightChecker:
             #Only check moon if at least one satellite is near Earth
             earth_dist1 = np.linalg.norm(sat1_pos - earth_pos)
             earth_dist2 = np.linalg.norm(sat2_pos - earth_pos)
-            
             if earth_dist1 < 1e6 or earth_dist2 < 1e6:  #Within 1 million km of Earth
                 if LineOfSightChecker.check_line_intersects_sphere(
                     sat1_pos, sat2_pos, moon_pos, MOON_RADIUS
@@ -585,7 +888,6 @@ class LineOfSightChecker:
                     return False, "Moon"
         
         return True, None
-    
     #Get Earth position at given time using real ephemeris
     @staticmethod
     def _get_earth_position(time):
@@ -647,173 +949,254 @@ class PreciseLagrangePoints:
     def __init__(self, ephemeris_data):
         self.ephemeris = ephemeris_data
         # Actual mass ratios
-        self.earth_moon_mass_ratio = 81.30056  #Earth/Moon mass ratio
-        self.earth_sun_mass_ratio = 332946.0   #Sun/Earth mass ratio
-        self.mars_sun_mass_ratio = 3098708.0   #Sun/Mars mass ratio
-    
-    #Calculate precise Earth-Moon L1 position
+        self.earth_moon_mass_ratio = 81.30056  # Earth/Moon mass ratio
+        self.earth_sun_mass_ratio = 332946.0   # Sun/Earth mass ratio  
+        self.mars_sun_mass_ratio = 3098708.0   # Sun/Mars mass ratio
+
+    #L1: Between Earth and Moon
     def earth_moon_l1(self, time_hours):
         earth_pos = self.ephemeris.get_earth_position(time_hours)
         moon_pos = self.ephemeris.get_moon_position(time_hours)
-        #Mass ratio mu = m2/(m1+m2)
-        mu = 1.0 / (1.0 + self.earth_moon_mass_ratio)
-        #Distance between Earth and Moon
-        r = np.linalg.norm(moon_pos - earth_pos)
-        #Solve for L1 distance from Earth using simplified cubic equation solution - for small mu, L1 ≈ r(1 - (μ/3)^(1/3))
-        l1_distance = r * (1 - (mu/3)**(1/3))
-        #Direction from Earth to Moon
-        earth_moon_dir = (moon_pos - earth_pos) / r
-        return earth_pos + l1_distance * earth_moon_dir
+    
+        # Work in Earth-Moon system
+        earth_moon_vector = moon_pos - earth_pos
+        earth_moon_distance = np.linalg.norm(earth_moon_vector)
+        earth_moon_direction = earth_moon_vector / earth_moon_distance
+    
+        # L1 is between Earth and Moon, closer to Earth
+        mu = 1.0 / (1.0 + self.earth_moon_mass_ratio)  # ≈ 0.012
+    
+        # L1 distance from Earth (approximately 85% of the way to Moon)
+        l1_distance_from_earth = earth_moon_distance * (1 - (mu/3)**(1/3))
+    
+        # L1 position in heliocentric coordinates
+        l1_pos = earth_pos + l1_distance_from_earth * earth_moon_direction
+    
+        # DEBUG
+        if time_hours < 50:
+            print(f"DEBUG L1: {l1_distance_from_earth:.0f} km from Earth ({l1_distance_from_earth/earth_moon_distance*100:.1f}% to Moon)")
+    
+        return l1_pos
 
-    #Calculate precise Earth-Sun L4 position
-    def earth_sun_l4(self, time_hours):
-        earth_pos = self.ephemeris.get_earth_position(time_hours)
-        sun_pos = np.array([0, 0, 0])  #Sun at barycenter
-        #L4 is 60° ahead of Earth in its orbit
-        earth_sun_vec = earth_pos - sun_pos
-        earth_distance = np.linalg.norm(earth_sun_vec)
-        #Get Earth's orbital plane normal - simplified to z-axis
-        earth_angle = np.arctan2(earth_sun_vec[1], earth_sun_vec[0])
-        l4_angle = earth_angle + np.pi/3  #60° ahead
-        return earth_distance * np.array([np.cos(l4_angle), np.sin(l4_angle), 0])
-
-    #Calculate precise Earth-Moon L2 position
+    #L2: Beyond Moon from Earth
     def earth_moon_l2(self, time_hours):
         earth_pos = self.ephemeris.get_earth_position(time_hours)
         moon_pos = self.ephemeris.get_moon_position(time_hours)
+    
+        # Work in Earth-Moon system
+        earth_moon_vector = moon_pos - earth_pos
+        earth_moon_distance = np.linalg.norm(earth_moon_vector)
+        earth_moon_direction = earth_moon_vector / earth_moon_distance
+    
+        # L2 is beyond Moon from Earth
         mu = 1.0 / (1.0 + self.earth_moon_mass_ratio)
-        r = np.linalg.norm(moon_pos - earth_pos)
-        l2_distance = r * (1 + (mu/3)**(1/3))
-        earth_moon_dir = (moon_pos - earth_pos) / r
-        return earth_pos + l2_distance * earth_moon_dir
+    
+        # L2 distance from Earth (approximately 115% of the way to Moon)
+        l2_distance_from_earth = earth_moon_distance * (1 + (mu/3)**(1/3))
+    
+        # L2 position in heliocentric coordinates
+        l2_pos = earth_pos + l2_distance_from_earth * earth_moon_direction
+    
+        # DEBUG
+        if time_hours < 50:
+            print(f"DEBUG L2: {l2_distance_from_earth:.0f} km from Earth ({l2_distance_from_earth/earth_moon_distance*100:.1f}% to Moon)")
+    
+        return l2_pos
 
-    #Calculate precise Mars-Sun L4 position
-    def mars_sun_l4(self, time_hours):
-        mars_pos = self.ephemeris.get_mars_position(time_hours)
-        sun_pos = np.array([0, 0, 0])
-        mu = 1.0 / (1.0 + self.mars_sun_mass_ratio)
-        #L4 forms equilateral triangle with Mars and Sun
-        mars_distance = np.linalg.norm(mars_pos)
-        mars_angle = np.arctan2(mars_pos[1], mars_pos[0])
-        l4_angle = mars_angle + np.pi/3
-        correction = 0.5 * mu  #Shifts L4 slightly
-        l4_angle += correction
-        return mars_distance * np.array([np.cos(l4_angle), np.sin(l4_angle), 0])
+    #L3: On opposite side of Earth from Moon, same distance from Earth as Moon
+    def earth_moon_l3(self, time_hours):
+        earth_pos = self.ephemeris.get_earth_position(time_hours)
+        moon_pos = self.ephemeris.get_moon_position(time_hours)
+    
+        # Work in Earth-Moon system
+        earth_moon_vector = moon_pos - earth_pos
+        earth_moon_distance = np.linalg.norm(earth_moon_vector)
+        earth_moon_direction = earth_moon_vector / earth_moon_distance
+    
+        # L3 is on the opposite side of Earth from Moon, at Moon's distance from Earth
+        l3_pos = earth_pos - earth_moon_distance * earth_moon_direction
+    
+        # DEBUG
+        if time_hours < 50:
+            l3_distance_from_earth = np.linalg.norm(l3_pos - earth_pos)
+            moon_angle = np.arctan2(earth_moon_vector[1], earth_moon_vector[0]) * 180 / np.pi
+            l3_relative = l3_pos - earth_pos
+            l3_angle = np.arctan2(l3_relative[1], l3_relative[0]) * 180 / np.pi
+            print(f"DEBUG L3: {l3_distance_from_earth:.0f} km from Earth (same as Moon: {earth_moon_distance:.0f})")
+            print(f"  Moon at {moon_angle:.1f}°, L3 at {l3_angle:.1f}° (should be ~180° apart)")
+    
+        return l3_pos
 
-    #Calculate precise Earth-Moon L3 position
-    #def earth_moon_l3(self, time_hours):
-    #    earth_pos = self.ephemeris.get_earth_position(time_hours)
-    #    moon_pos = self.ephemeris.get_moon_position(time_hours)
-    #    mu = 1.0 / (1.0 + self.earth_moon_mass_ratio)
-    #    r = np.linalg.norm(moon_pos - earth_pos)
-        #L3 is on opposite side of Earth from Moon
-    #    l3_distance = r * (1 + 5*mu/12)  #Approximation for small mu
-    #    earth_moon_dir = (moon_pos - earth_pos) / r
-    #    return earth_pos - l3_distance * earth_moon_dir
-
-    #Calculate precise Earth-Moon L4 position
+    #L4: Forms equilateral triangle with Earth and Moon (60° ahead of Moon)
     def earth_moon_l4(self, time_hours):
         earth_pos = self.ephemeris.get_earth_position(time_hours)
         moon_pos = self.ephemeris.get_moon_position(time_hours)
-        #L4 forms equilateral triangle 60° ahead
-        earth_moon_vec = moon_pos - earth_pos
-        distance = np.linalg.norm(earth_moon_vec)
-        angle = np.arctan2(earth_moon_vec[1], earth_moon_vec[0]) + np.pi/3
-        return earth_pos + distance * np.array([np.cos(angle), np.sin(angle), 0])
+    
+        # Work in Earth-Moon system
+        earth_moon_vector = moon_pos - earth_pos
+        earth_moon_distance = np.linalg.norm(earth_moon_vector)
+    
+        # Calculate Moon's angle relative to Earth
+        moon_angle = np.arctan2(earth_moon_vector[1], earth_moon_vector[0])
+    
+        # L4 is 60° ahead of Moon in Moon's orbit around Earth
+        l4_angle = moon_angle + np.pi/3  # +60°
+    
+        # L4 is at the same distance from Earth as the Moon (equilateral triangle)
+        l4_relative_to_earth = earth_moon_distance * np.array([
+            np.cos(l4_angle), 
+            np.sin(l4_angle), 
+            earth_moon_vector[2] / earth_moon_distance  # Preserve any Z-component
+        ])
+    
+        # Transform to heliocentric coordinates
+        l4_pos = earth_pos + l4_relative_to_earth
+    
+        # DEBUG
+        if time_hours < 50:
+            moon_angle_deg = moon_angle * 180 / np.pi
+            l4_angle_deg = l4_angle * 180 / np.pi
+            print(f"DEBUG L4 FIXED: Moon at {moon_angle_deg:.1f}° from Earth, L4 at {l4_angle_deg:.1f}°")
+            print(f"  Distance from Earth: {earth_moon_distance:.0f} km (same as Moon)")
+        
+            # Verify equilateral triangle
+            l4_to_moon_distance = np.linalg.norm(l4_pos - moon_pos)
+            print(f"  L4-Moon distance: {l4_to_moon_distance:.0f} km (should = {earth_moon_distance:.0f})")
+    
+        return l4_pos
 
-    #Calculate precise Earth-Moon L5 position
+    #L5: Forms equilateral triangle with Earth and Moon (60° behind Moon)
     def earth_moon_l5(self, time_hours):
         earth_pos = self.ephemeris.get_earth_position(time_hours)
-        moon_pos = self.ephemeris.get_moon_position(time_hours)   
-        #L5 forms equilateral triangle 60° behind
-        earth_moon_vec = moon_pos - earth_pos
-        distance = np.linalg.norm(earth_moon_vec)
-        angle = np.arctan2(earth_moon_vec[1], earth_moon_vec[0]) - np.pi/3
-        return earth_pos + distance * np.array([np.cos(angle), np.sin(angle), 0])
+        moon_pos = self.ephemeris.get_moon_position(time_hours)
+        # Work in Earth-Moon system
+        earth_moon_vector = moon_pos - earth_pos
+        earth_moon_distance = np.linalg.norm(earth_moon_vector)
+        # Calculate Moon's angle relative to Earth
+        moon_angle = np.arctan2(earth_moon_vector[1], earth_moon_vector[0])
+        # L5 is 60° behind Moon in Moon's orbit around Earth
+        l5_angle = moon_angle - np.pi/3  # -60°
+        # L5 is at the same distance from Earth as the Moon (equilateral triangle)
+        l5_relative_to_earth = earth_moon_distance * np.array([
+            np.cos(l5_angle), 
+            np.sin(l5_angle), 
+            earth_moon_vector[2] / earth_moon_distance  # Preserve any Z-component
+        ])
+    
+        # Transform to heliocentric coordinates
+        l5_pos = earth_pos + l5_relative_to_earth
+    
+        # DEBUG
+        if time_hours < 50:
+            moon_angle_deg = moon_angle * 180 / np.pi
+            l5_angle_deg = l5_angle * 180 / np.pi
+            print(f"DEBUG L5 FIXED: Moon at {moon_angle_deg:.1f}° from Earth, L5 at {l5_angle_deg:.1f}°")
+            print(f"  Distance from Earth: {earth_moon_distance:.0f} km (same as Moon)")
+            # Verify equilateral triangle
+            l5_to_moon_distance = np.linalg.norm(l5_pos - moon_pos)
+            print(f"  L5-Moon distance: {l5_to_moon_distance:.0f} km (should = {earth_moon_distance:.0f})")
+    
+        return l5_pos
 
-    #Calculate precise Earth-Sun L1 position
+    #L1: Between Sun and Earth
     def earth_sun_l1(self, time_hours):
         earth_pos = self.ephemeris.get_earth_position(time_hours)
-        sun_pos = np.array([0, 0, 0])   
+        sun_pos = np.array([0, 0, 0])  # Sun at origin   
+        earth_distance = np.linalg.norm(earth_pos)
         mu = 1.0 / (1.0 + self.earth_sun_mass_ratio)
-        r = np.linalg.norm(earth_pos - sun_pos)
-        #L1 between Sun and Earth
-        l1_distance = r * (1 - (mu/3)**(1/3))
-        sun_earth_dir = (earth_pos - sun_pos) / r
+        
+        # L1 between Sun and Earth
+        l1_distance = earth_distance * (1 - (mu/3)**(1/3))
+        
+        # Direction from Sun toward Earth
+        sun_earth_dir = earth_pos / earth_distance
+        
         return sun_pos + l1_distance * sun_earth_dir
 
-    #Calculate precise Earth-Sun L2 position
+    #L2: Beyond Earth from Sun
     def earth_sun_l2(self, time_hours):
         earth_pos = self.ephemeris.get_earth_position(time_hours)
         sun_pos = np.array([0, 0, 0])   
+        earth_distance = np.linalg.norm(earth_pos)
         mu = 1.0 / (1.0 + self.earth_sun_mass_ratio)
-        r = np.linalg.norm(earth_pos - sun_pos)
-        #L2 beyond Earth from Sun
-        l2_distance = r * (1 + (mu/3)**(1/3))
-        sun_earth_dir = (earth_pos - sun_pos) / r
+        
+        # L2 beyond Earth from Sun
+        l2_distance = earth_distance * (1 + (mu/3)**(1/3))
+        
+        sun_earth_dir = earth_pos / earth_distance
         return sun_pos + l2_distance * sun_earth_dir
 
-    #Calculate precise Earth-Sun L3 position
-    #def earth_sun_l3(self, time_hours):
-    #    earth_pos = self.ephemeris.get_earth_position(time_hours)
-    #    sun_pos = np.array([0, 0, 0])   
-    #    mu = 1.0 / (1.0 + self.earth_sun_mass_ratio)
-    #    r = np.linalg.norm(earth_pos - sun_pos)
-    #    #L3 on opposite side of Sun
-    #    l3_distance = r * (1 + 7*mu/12)  #Approximation
-    #    sun_earth_dir = (earth_pos - sun_pos) / r
-    #    return sun_pos - l3_distance * sun_earth_dir
-
-    #Calculate precise Earth-Sun L5 position
-    def earth_sun_l5(self, time_hours):
-        earth_pos = self.ephemeris.get_earth_position(time_hours)
-        #L5 is 60° behind Earth in its orbit
+    #L4: 60° ahead of Earth in orbit around Sun
+    def earth_sun_l4(self, time_hours):
+        earth_pos = self.ephemeris.get_earth_position(time_hours)   
         earth_distance = np.linalg.norm(earth_pos)
         earth_angle = np.arctan2(earth_pos[1], earth_pos[0])
-        l5_angle = earth_angle - np.pi/3
-        return earth_distance * np.array([np.cos(l5_angle), np.sin(l5_angle), 0])
+        
+        # L4 is 60° ahead of Earth
+        l4_angle = earth_angle + np.pi/3
+        return earth_distance * np.array([
+            np.cos(l4_angle), 
+            np.sin(l4_angle), 
+            earth_pos[2] / earth_distance
+        ])
 
-    #Calculate precise Mars-Sun L1 position
+    #L5: 60° behind Earth in orbit around Sun
+    def earth_sun_l5(self, time_hours):
+        earth_pos = self.ephemeris.get_earth_position(time_hours)   
+        earth_distance = np.linalg.norm(earth_pos)
+        earth_angle = np.arctan2(earth_pos[1], earth_pos[0])
+        
+        # L5 is 60° behind Earth
+        l5_angle = earth_angle - np.pi/3
+        return earth_distance * np.array([
+            np.cos(l5_angle), 
+            np.sin(l5_angle), 
+            earth_pos[2] / earth_distance
+        ])
+
+    #L1: Between Sun and Mars
     def mars_sun_l1(self, time_hours):
         mars_pos = self.ephemeris.get_mars_position(time_hours)
         sun_pos = np.array([0, 0, 0])   
+        mars_distance = np.linalg.norm(mars_pos)
         mu = 1.0 / (1.0 + self.mars_sun_mass_ratio)
-        r = np.linalg.norm(mars_pos - sun_pos)
-        #L1 between Sun and Mars
-        l1_distance = r * (1 - (mu/3)**(1/3))
-        sun_mars_dir = (mars_pos - sun_pos) / r
+        l1_distance = mars_distance * (1 - (mu/3)**(1/3))
+        sun_mars_dir = mars_pos / mars_distance
         return sun_pos + l1_distance * sun_mars_dir
 
-    #Calculate precise Mars-Sun L2 position
+    #L2: Beyond Mars from Sun
     def mars_sun_l2(self, time_hours):
         mars_pos = self.ephemeris.get_mars_position(time_hours)
-        sun_pos = np.array([0, 0, 0])
+        sun_pos = np.array([0, 0, 0])   
+        mars_distance = np.linalg.norm(mars_pos)
         mu = 1.0 / (1.0 + self.mars_sun_mass_ratio)
-        r = np.linalg.norm(mars_pos - sun_pos)
-        #L2 beyond Mars from Sun
-        l2_distance = r * (1 + (mu/3)**(1/3))
-        sun_mars_dir = (mars_pos - sun_pos) / r
+        l2_distance = mars_distance * (1 + (mu/3)**(1/3))
+        sun_mars_dir = mars_pos / mars_distance
         return sun_pos + l2_distance * sun_mars_dir
 
-    #Calculate precise Mars-Sun L3 position
-    #def mars_sun_l3(self, time_hours):
-    #    mars_pos = self.ephemeris.get_mars_position(time_hours)
-    #    sun_pos = np.array([0, 0, 0])
-    #    mu = 1.0 / (1.0 + self.mars_sun_mass_ratio)
-    #    r = np.linalg.norm(mars_pos - sun_pos)
-    #    #L3 on opposite side of Sun
-    #    l3_distance = r * (1 + 7*mu/12)  #Approximation
-    #    sun_mars_dir = (mars_pos - sun_pos) / r
-    #    return sun_pos - l3_distance * sun_mars_dir
+    #L4: 60° ahead of Mars in orbit around Sun
+    def mars_sun_l4(self, time_hours):
+        mars_pos = self.ephemeris.get_mars_position(time_hours)   
+        mars_distance = np.linalg.norm(mars_pos)
+        mars_angle = np.arctan2(mars_pos[1], mars_pos[0])
+        l4_angle = mars_angle + np.pi/3
+        return mars_distance * np.array([
+            np.cos(l4_angle), 
+            np.sin(l4_angle), 
+            mars_pos[2] / mars_distance
+        ])
 
-    #Calculate precise Mars-Sun L5 position
+    #L5: 60° behind Mars in orbit around Sun
     def mars_sun_l5(self, time_hours):
         mars_pos = self.ephemeris.get_mars_position(time_hours)   
-        #L5 is 60° behind Mars in its orbit
         mars_distance = np.linalg.norm(mars_pos)
         mars_angle = np.arctan2(mars_pos[1], mars_pos[0])
         l5_angle = mars_angle - np.pi/3
-        return mars_distance * np.array([np.cos(l5_angle), np.sin(l5_angle), 0])
+        return mars_distance * np.array([
+            np.cos(l5_angle), 
+            np.sin(l5_angle), 
+            mars_pos[2] / mars_distance
+        ])
 
 #Satellite with real orbital mechanics
 class EnhancedSatellite(Satellite):
@@ -826,6 +1209,68 @@ class EnhancedSatellite(Satellite):
         #Initialize with real ephemeris
         self.ephemeris = RealEphemerisData()
         self.lagrange_calculator = PreciseLagrangePoints(self.ephemeris)
+        if planet in ['Earth', 'Mars']:
+            self._initialize_orbital_state()
+
+    #Initialize position and velocity for proper circular orbit
+    def _initialize_orbital_state(self):
+        if self.planet == 'Earth':
+            central_body_mu = 398600.4418e9  # Earth GM in m³/s²
+            orbit_radius_m = (EARTH_RADIUS + self.orbit_altitude) * 1000  # Convert km to meters   
+            print(f"DEBUG {self.sat_id}: Earth orbit_radius = {orbit_radius_m/1000:.0f} km")
+        elif self.planet == 'Mars':
+            central_body_mu = 42828.37e9  # Mars GM in m³/s²  
+            orbit_radius_m = (MARS_RADIUS + self.orbit_altitude) * 1000
+            print(f"DEBUG {self.sat_id}: Mars orbit_radius = {orbit_radius_m/1000:.0f} km")
+        else:
+            return
+
+        #Position in orbital plane (in METERS first)
+        x_orbit = orbit_radius_m * np.cos(self.phase)
+        y_orbit = orbit_radius_m * np.sin(self.phase)
+        z_orbit = y_orbit * np.sin(self.inclination)
+        y_orbit = y_orbit * np.cos(self.inclination)
+    
+        # Apply RAAN rotation for position
+        cos_raan = np.cos(self.raan)
+        sin_raan = np.sin(self.raan)
+    
+        # Position in KILOMETERS (convert from meters)
+        self.position = np.array([
+            (x_orbit * cos_raan - y_orbit * sin_raan) / 1000,
+            (x_orbit * sin_raan + y_orbit * cos_raan) / 1000,
+            z_orbit / 1000
+        ])
+    
+        # Circular orbital velocity calculation
+        orbital_speed = np.sqrt(central_body_mu / orbit_radius_m)  # m/s
+        print(f"DEBUG {self.sat_id}: Expected orbital speed = {orbital_speed:.0f} m/s")
+    
+        # Velocity perpendicular to position in orbital plane (in m/s)
+        v_x_orbit = -orbital_speed * np.sin(self.phase)
+        v_y_orbit = orbital_speed * np.cos(self.phase)
+        v_z_orbit = v_y_orbit * np.sin(self.inclination)
+        v_y_orbit = v_y_orbit * np.cos(self.inclination)
+    
+        # Apply RAAN rotation for velocity and convert to km/s
+        self.velocity = np.array([
+            (v_x_orbit * cos_raan - v_y_orbit * sin_raan) / 1000,
+            (v_x_orbit * sin_raan + v_y_orbit * cos_raan) / 1000,
+            v_z_orbit / 1000
+        ])
+    
+        # Check final state
+        final_radius = np.linalg.norm(self.position)
+        final_speed = np.linalg.norm(self.velocity) * 1000  # Convert back to m/s
+        final_angle = np.arctan2(self.position[1], self.position[0]) * 180 / np.pi
+        print(f"VERIFY {self.sat_id}:")
+        print(f"  Final radius: {final_radius:.0f} km (expected: {orbit_radius_m/1000:.0f})")
+        print(f"  Final speed: {final_speed:.0f} m/s (expected: {orbital_speed:.0f})")
+        print(f"  Final angle: {final_angle:.1f}° (expected: {self.phase*180/np.pi:.1f}°)")
+        if abs(final_radius - orbit_radius_m/1000) > 100:  # More than 100km error
+            print(f"ERROR: {self.sat_id} radius mismatch!")
+        if abs(final_speed - orbital_speed) > 100:  # More than 100 m/s error
+            print(f"ERROR: {self.sat_id} speed mismatch!")
 
 class TrafficQueue:
     def __init__(self):
@@ -882,7 +1327,6 @@ class TransmissionSchedule:
     def get_assignment(self, satellite_id):
         return self.satellite_assignments.get(satellite_id)
 
-#Simplified metrics collection for thesis graphs
 class ThesisMetricsCollector:
     def __init__(self):
         #Time series data for graphs
@@ -903,8 +1347,12 @@ class ThesisMetricsCollector:
             'navigation_assisted_pct': [],
             'average_latency_ms': []
             }
+
+        self.controller_assignments = {
+            'time': [],
+            'assignments': []
+            }
         
-        # NEW METRICS 1-8
         # 1. Temporal Link Stability
         self.link_stability = {
             'time': [],
@@ -982,6 +1430,12 @@ class ThesisMetricsCollector:
             'polar_coverage': [],
             'equatorial_coverage': []
         }
+
+        # 9. Controller Assignment Tracking
+        self.controller_assignments = {
+            'time': [],
+            'assignments': []
+        }
         
         #data for specific analysis
         self.link_quality_distribution = []
@@ -995,7 +1449,6 @@ class ThesisMetricsCollector:
         optical = stats['optical_links']
         coord = stats['controller_coordination']
         traffic = stats['traffic_management']
-        
         self.time_series['time'].append(time)
         self.time_series['earth_connectivity'].append(stats['earth_connectivity'])
         self.time_series['mars_connectivity'].append(stats['mars_connectivity']) 
@@ -1011,7 +1464,6 @@ class ThesisMetricsCollector:
         self.time_series['blocked_by_sun'].append(getattr(network, 'last_blocked_by_sun', 0))
         self.time_series['blocked_by_earth'].append(getattr(network, 'last_blocked_by_earth', 0))
         self.time_series['blocked_by_mars'].append(getattr(network, 'last_blocked_by_mars', 0))
-        
         #Record distributions periodically
         if time % 1000 == 0:
             self.link_quality_distribution.append({
@@ -1034,6 +1486,7 @@ class ThesisMetricsCollector:
         self._record_queue_metrics(network, time)
         self._record_occlusion_events(network, time)
         self._record_coverage_metrics(network, time)
+        self._record_controller_assignments(network, time)
     
     def _record_link_stability(self, network, time):
         current_links = {}
@@ -1068,7 +1521,6 @@ class ThesisMetricsCollector:
         #Calculate metrics
         avg_duration = total_duration / max(link_count, 1)
         interruption_freq = interruptions / max(len(network.satellites), 1)
-        
         #Calculate MTBF
         total_failures = sum(link_data.get('interruptions', 0) 
                            for sat_links in self.link_tracking.values() 
@@ -1085,7 +1537,6 @@ class ThesisMetricsCollector:
         failed = 0
         total_latency = 0
         seamless = 0
-        
         for sat in network.satellites:
             if sat.sat_type == 'controller' and hasattr(sat, 'navigation_coordinator'):
                 if hasattr(sat.navigation_coordinator.fso_scheduler, 'scheduled_handoffs'):
@@ -1110,7 +1561,6 @@ class ThesisMetricsCollector:
         #Calculate average latency from recent events
         recent_events = [e for e in self.handoff_events if time - e['time'] < 100]
         avg_latency = np.mean([e.get('latency', 0.1) for e in recent_events]) if recent_events else 0.1
-        
         self.handoff_metrics['time'].append(time)
         self.handoff_metrics['planned_handoffs'].append(planned)
         self.handoff_metrics['successful_handoffs'].append(successful)
@@ -1123,22 +1573,18 @@ class ThesisMetricsCollector:
         loads = []
         utilizations = []
         response_times = []
-        
         for controller in controllers:
             if hasattr(controller, 'satellites_in_region'):
                 # Calculate load as satellites managed / max capacity
                 load = len(controller.satellites_in_region)
                 max_capacity = 50  # Assume max 50 satellites per controller
                 utilization = (load / max_capacity) * 100
-                
                 loads.append(load)
                 utilizations.append(utilization)
-                
                 # Simulate response time based on load
                 base_response = 0.01  # 10ms base
                 response_time = base_response * (1 + load/20)  # Increases with load
                 response_times.append(response_time)
-        
         if loads:
             load_variance = np.var(loads)
             avg_utilization = np.mean(utilizations)
@@ -1149,7 +1595,6 @@ class ThesisMetricsCollector:
             avg_utilization = 0
             max_utilization = 0
             avg_response = 0
-        
         self.controller_load['time'].append(time)
         self.controller_load['load_variance'].append(load_variance)
         self.controller_load['average_utilization'].append(avg_utilization)
@@ -1158,7 +1603,6 @@ class ThesisMetricsCollector:
     
     def _record_topology_metrics(self, network, time):
         G = network.connection_graph
-        
         if G.number_of_nodes() > 0 and G.number_of_edges() > 0:
             # Convert to undirected for some metrics
             G_undirected = G.to_undirected()
@@ -1281,10 +1725,8 @@ class ThesisMetricsCollector:
         blockers = [occ['blocker'] for occ in self.current_occlusions.values()]
         if len(set(blockers)) > 1:
             simultaneous = len(self.current_occlusions)
-        
         # Find longest blackout
         longest = max([time - occ['start_time'] for occ in self.current_occlusions.values()]) if self.current_occlusions else 0
-        
         self.occlusion_events['time'].append(time)
         self.occlusion_events['sun_occlusion_duration'].append(sun_duration)
         self.occlusion_events['earth_occlusion_duration'].append(earth_duration)
@@ -1300,26 +1742,52 @@ class ThesisMetricsCollector:
         # Separate polar and equatorial coverage
         earth_polar = self._calculate_polar_coverage(network, 'Earth')
         earth_equatorial = self._calculate_equatorial_coverage(network, 'Earth')
-        
+
         self.coverage_metrics['time'].append(time)
         self.coverage_metrics['earth_surface_coverage'].append(earth_coverage)
         self.coverage_metrics['mars_surface_coverage'].append(mars_coverage)
         self.coverage_metrics['polar_coverage'].append(earth_polar)
         self.coverage_metrics['equatorial_coverage'].append(earth_equatorial)
     
+    #Record controller region assignments at this time step
+    def _record_controller_assignments(self, network, time):
+        controllers = [sat for sat in network.satellites if sat.sat_type == 'controller']
+        assignment_snapshot = {
+        'time_step': time,
+        'controllers': {}
+        }
+        total_assigned_satellites = 0
+        for controller in controllers:
+            controller_info = {
+                'controller_id': controller.sat_id,
+                'lagrange_point': controller.lagrange_point,
+                'satellites_assigned': [],
+                'satellite_count': 0
+            }
+            if hasattr(controller, 'satellites_in_region'):
+                assigned_satellites = [sat.sat_id for sat in controller.satellites_in_region]
+                controller_info['satellites_assigned'] = assigned_satellites
+                controller_info['satellite_count'] = len(assigned_satellites)
+                total_assigned_satellites += len(assigned_satellites)
+            assignment_snapshot['controllers'][controller.sat_id] = controller_info
+        #summary statistics
+        assignment_snapshot['total_assigned_satellites'] = total_assigned_satellites
+        assignment_snapshot['active_controllers'] = sum(1 for c in assignment_snapshot['controllers'].values() 
+                                                    if c['satellite_count'] > 0)
+        #snapshot
+        self.controller_assignments['time'].append(time)
+        self.controller_assignments['assignments'].append(assignment_snapshot)
+
     def _calculate_surface_coverage(self, network, planet):
-        # Simplified coverage calculation
-        # Count satellites that can see the planet
+        # Simplified coverage calculation - Count satellites that can see the planet
         if planet == 'Earth':
             sats = [s for s in network.satellites if s.planet == 'Earth']
             planet_radius = EARTH_RADIUS
         else:
             sats = [s for s in network.satellites if s.planet == 'Mars']
             planet_radius = MARS_RADIUS
-        
         if not sats:
             return 0
-        
         # Each satellite covers a certain area based on altitude
         coverage_area = 0
         for sat in sats:
@@ -1342,7 +1810,6 @@ class ThesisMetricsCollector:
             sats = [s for s in network.satellites if s.planet == 'Earth' and s.inclination > 60]
         else:
             sats = [s for s in network.satellites if s.planet == 'Mars' and s.inclination > 60]
-        
         # Simple metric: percentage of high-inclination satellites
         total_sats = len([s for s in network.satellites if s.planet == planet])
         return (len(sats) / max(total_sats, 1)) * 100
@@ -1353,10 +1820,8 @@ class ThesisMetricsCollector:
             sats = [s for s in network.satellites if s.planet == 'Earth' and s.inclination < 30]
         else:
             sats = [s for s in network.satellites if s.planet == 'Mars' and s.inclination < 30]
-        
         total_sats = len([s for s in network.satellites if s.planet == planet])
         return (len(sats) / max(total_sats, 1)) * 100
-
 
     #Export data in formats ready for thesis graphs
     def export_for_thesis(self, prefix="thesis_data"):
@@ -1421,8 +1886,6 @@ class ThesisMetricsCollector:
                     self.topology_metrics['edge_connectivity'][i],
                     self.topology_metrics['critical_nodes'][i]
                 ])
-        
-        # 5. Export Queue Metrics
         with open(f'results/{prefix}_queue_performance.csv', 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['Time_Hours', 'Avg_Queue_Depth', 'Max_Queue_Depth', 'Overflow_Events', 'Avg_Wait_Time', 'Deadline_Miss_Rate'])
@@ -1435,8 +1898,6 @@ class ThesisMetricsCollector:
                     self.queue_metrics['average_wait_time'][i],
                     self.queue_metrics['deadline_miss_rate'][i]
                 ])
-        
-        # 6. Export Occlusion Events
         with open(f'results/{prefix}_occlusion_events.csv', 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['Time_Hours', 'Sun_Duration', 'Earth_Duration', 'Mars_Duration', 'Simultaneous', 'Longest_Blackout'])
@@ -1460,6 +1921,19 @@ class ThesisMetricsCollector:
                     self.coverage_metrics['polar_coverage'][i],
                     self.coverage_metrics['equatorial_coverage'][i]
                 ])
+        with open(f'results/{prefix}_controller_assignments.csv', 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Time_Hours', 'Controller_ID', 'Lagrange_Point', 'Satellites_Assigned', 'Satellite_Count'])
+            for i, assignment in enumerate(self.controller_assignments['assignments']):
+                time_val = self.controller_assignments['time'][i]
+                for controller_id, controller_info in assignment['controllers'].items():
+                    writer.writerow([
+                        time_val,
+                        controller_id,
+                        controller_info['lagrange_point'],
+                        ','.join(controller_info['satellites_assigned']),
+                        controller_info['satellite_count']
+                    ])
         print(f"\nThesis data exported to results/{prefix}_*.csv")
         
     #Export key performance indicators summary
@@ -1467,7 +1941,6 @@ class ThesisMetricsCollector:
         with open(f'results/{prefix}_kpis.csv', 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['Metric', 'Average', 'Min', 'Max', 'Final'])
-            
             metrics = [
                 ('Earth Connectivity (%)', 'earth_connectivity'),
                 ('Mars Connectivity (%)', 'mars_connectivity'),
@@ -1547,7 +2020,6 @@ class TrafficManager:
         self.transmission_schedule = {}  # time_slot: [satellite_assignments]
         self.relay_capacity_monitor = {}  # relay_id: current_load_percentage
         self.priority_levels = ['EMERGENCY', 'CRITICAL', 'HIGH', 'NORMAL', 'LOW']
-        
         # Initialize traffic queues for managed satellites
         self.last_traffic_update = 0
         self.traffic_history = []
@@ -1581,7 +2053,6 @@ class TrafficManager:
                     'count': len(priority_data),
                     'size_gb': sum(p['size_gb'] for p in priority_data)
                 }
-            
             traffic_demand[satellite.sat_id] = {
                 'total_data_gb': total_size,
                 'priority_breakdown': priority_breakdown,
@@ -1617,10 +2088,8 @@ class TrafficManager:
             # Add urgency bonus
             priority_score += traffic_data['deadline_urgency'] * 25
             satellite_priorities.append((sat_id, priority_score))
-        
         #Sort by priority- highest first
         satellite_priorities.sort(key=lambda x: x[1], reverse=True)
-        
         #Assign time slots and relay targets
         current_slot_time = current_time
         for satellite_id, priority_score in satellite_priorities:
@@ -1629,13 +2098,11 @@ class TrafficManager:
                 continue
             #Find optimal relay
             optimal_relay = self._find_optimal_relay_for_traffic(satellite_id, relay_positions, schedule)
-            
             if optimal_relay:
                 #Calculate transmission duration
                 estimated_data_rate = 8e9  #8 Gbps estimated
                 duration = max(TRANSMISSION_SLOT_DURATION, 
                              traffic_data['total_data_gb'] * 8 / estimated_data_rate * 1/3600)  # Convert to hours
-                
                 #Determine priority
                 main_priority = 'NORMAL'
                 for priority in ['EMERGENCY', 'CRITICAL', 'HIGH']:
@@ -1797,6 +2264,113 @@ class TrafficManager:
             'ER4': {'position': np.array([0, -150000000, 0]), 'predicted_positions': []},
         }
 
+class CoordinatedTrafficManager(TrafficManager):
+    def __init__(self, controller_id):
+        super().__init__(controller_id)
+        self.coordination_state = 'IDLE'  # IDLE, PROPOSING, NEGOTIATING, COMMITTED
+        self.current_intention = None
+        self.last_coordination_round = 0
+        self.approved_assignments = {}  # satellite_id: assignment_details
+        self.rejected_assignments = {}  # satellite_id: assignment_details
+        
+    #Create scheduling intention for coordination
+    def create_scheduling_intention(self, traffic_analysis, current_time):
+        intention = SchedulingIntention(self.controller_id, current_time)
+        # Analyze traffic and create proposals
+        satellite_priorities = []
+        for sat_id, traffic_data in traffic_analysis.items():
+            if traffic_data['total_data_gb'] > 0:
+                priority_score = self._calculate_priority_score(traffic_data)
+                satellite_priorities.append((sat_id, priority_score, traffic_data))
+        
+        # Sort by priority
+        satellite_priorities.sort(key=lambda x: x[1], reverse=True)
+        
+        # Create relay assignments
+        for sat_id, priority_score, traffic_data in satellite_priorities:
+            # Determine relay and capacity needs
+            optimal_relay = self._find_optimal_relay_for_coordination(sat_id, traffic_data)
+            capacity_needed = min(20, max(1, int(traffic_data['total_data_gb'] * 2)))  # 1-20 capacity units
+            
+            # Determine priority level
+            main_priority = 'NORMAL'
+            for priority in ['EMERGENCY', 'CRITICAL', 'HIGH']:
+                if traffic_data['priority_breakdown'][priority]['size_gb'] > 0:
+                    main_priority = priority
+                    break
+            
+            # Calculate transmission duration
+            duration = max(0.02, traffic_data['total_data_gb'] / 5)  # Hours at 5 GB/hour
+            
+            intention.add_assignment(
+                satellite_id=sat_id,
+                relay_id=optimal_relay,
+                priority=main_priority,
+                capacity_needed=capacity_needed,
+                start_time=current_time,
+                duration=duration
+            )
+        
+        self.current_intention = intention
+        self.coordination_state = 'PROPOSING'
+        return intention
+    
+    #Enhanced relay selection for coordination
+    def _find_optimal_relay_for_coordination(self, satellite_id, traffic_data):
+        # Priority: select relay based on satellite ID and traffic urgency
+        earth_relays = ['ER1', 'ER2', 'ER3', 'ER4']
+        
+        # Emergency traffic gets best relay (ER1)
+        if traffic_data['deadline_urgency'] > 0:
+            return 'ER1'
+        
+        # High priority gets good relays (ER1, ER2)
+        if any(traffic_data['priority_breakdown'][p]['size_gb'] > 0 for p in ['CRITICAL', 'HIGH']):
+            return earth_relays[hash(satellite_id) % 2]
+        
+        # Normal traffic distributed across all relays
+        return earth_relays[hash(satellite_id) % len(earth_relays)]
+    
+    #Calculate priority score for scheduling
+    def _calculate_priority_score(self, traffic_data):
+        score = 0
+        for priority, data in traffic_data['priority_breakdown'].items():
+            priority_weights = {'EMERGENCY': 100, 'CRITICAL': 50, 'HIGH': 20, 'NORMAL': 10, 'LOW': 5}
+            score += data['size_gb'] * priority_weights.get(priority, 1)
+        score += traffic_data['deadline_urgency'] * 25
+        return score
+    
+    #Apply the coordinated consensus schedule
+    def apply_consensus_schedule(self, controller_updates, current_time):
+        approved = controller_updates.get('approved', [])
+        rejected = controller_updates.get('rejected', [])   
+        print(f"    Controller {self.controller_id}: Applying {len(approved)} approved, {len(rejected)} rejected assignments")
+        # Store approved assignments for satellites to use
+        for assignment in approved:
+            satellite_id = assignment['satellite_id']
+            self.approved_assignments[satellite_id] = {
+                'relay_id': assignment['relay_id'],
+                'priority': assignment['priority'],
+                'start_time': assignment['start_time'],
+                'duration': assignment['duration'],
+                'auth_token': f"COORD_{satellite_id}_{int(current_time*1000)}"
+            }
+        # Handle rejected assignments - try backup relays or reschedule
+        for assignment in rejected:
+            satellite_id = assignment['satellite_id']
+            # Try backup relay assignment
+            backup_relays = [r for r in ['ER2', 'ER3', 'ER4'] if r != assignment['relay_id']]
+            if backup_relays:
+                self.rejected_assignments[satellite_id] = {
+                    'original_relay': assignment['relay_id'],
+                    'backup_relay': backup_relays[0],
+                    'reschedule_time': current_time + 1.0,  # Reschedule 1 hour later
+                    'reason': 'CAPACITY_CONFLICT'
+                }
+        
+        self.coordination_state = 'COMMITTED'
+        return len(approved), len(rejected)
+
 #Enhanced navigation update with traffic management
 class TrafficCoordinationUpdate:
     def __init__(self, controller_id, timestamp, satellite_instructions, 
@@ -1852,57 +2426,54 @@ class RealisticOrbitalMechanics:
     
     #Propagate orbit including J2 perturbation (Earth's oblateness), Solar radiation pressure, Third-body effects (Sun, Moon) and Relativistic corrections
     def propagate_orbit_with_perturbations(self, state, t, params):
-        r_vec = state[:3]  #Position vector (m)
-        v_vec = state[3:]  #Velocity vector (m/s)
+        r_vec = state[:3]  # Position in meters
+        v_vec = state[3:]  # Velocity in m/s
         r = np.linalg.norm(r_vec)
-        
-        #Primary gravitational acceleration
-        central_body = params.get('central_body', 'Earth')
-        if central_body == 'Earth':
-            mu = self.mu_earth
-        elif central_body == 'Mars':
-            mu = self.mu_mars
-        else:
-            mu = self.mu_earth
-            
-        a_gravity = -mu / r**3 * r_vec
-        
-        #J2 perturbation - only for Earth
-        if central_body == 'Earth':
-            J2 = 1.08263e-3
-            R_earth = 6.371e6  #meters
-            a_J2 = self._calculate_J2_perturbation(r_vec, J2, R_earth)
-        else:
-            a_J2 = np.zeros(3)
-        
-        #Solar radiation pressure
-        a_srp = self._calculate_solar_radiation_pressure(r_vec, params)
-        #Third-body perturbations
-        a_third_body = np.zeros(3)
-        if 'sun_position' in params:
-            a_third_body += self._calculate_third_body_effect(
-                r_vec, params['sun_position'], self.mu_sun
-            )
-        if 'moon_position' in params and central_body == 'Earth':
-            a_third_body += self._calculate_third_body_effect(
-                r_vec, params['moon_position'], self.mu_moon
-            )
-        
-        #Relativistic correction
-        a_rel = self._calculate_relativistic_correction(r_vec, v_vec, mu)
-        #Total acceleration
-        a_total = a_gravity + a_J2 + a_srp + a_third_body + a_rel
-        #[velocity, acceleration]
-        return np.concatenate([v_vec, a_total])
     
+        # Primary gravity (should dominate)
+        a_gravity = -self.mu_earth / r**3 * r_vec
+    
+        # Perturbations (should be small)
+        a_J2 = self._calculate_J2_perturbation(r_vec, 1.08263e-3, 6.371e6) if params['central_body'] == 'Earth' else np.zeros(3)
+        a_srp = self._calculate_solar_radiation_pressure(r_vec, params)
+    
+        # Debug magnitudes
+        gravity_mag = np.linalg.norm(a_gravity)
+        j2_mag = np.linalg.norm(a_J2)
+        srp_mag = np.linalg.norm(a_srp)
+    
+        # Perturbations should be << 1% of gravity for reasonable orbits
+        if j2_mag > 0.01 * gravity_mag:
+            print(f"J2 too large: {j2_mag/gravity_mag*100:.2f}% of gravity")
+            a_J2 = np.zeros(3)
+    
+        if srp_mag > 0.001 * gravity_mag:
+            print(f"SRP too large: {srp_mag/gravity_mag*100:.2f}% of gravity") 
+            a_srp = np.zeros(3)
+    
+        a_total = a_gravity + a_J2 + a_srp
+        return np.concatenate([v_vec, a_total])
+
     #Calculate J2 perturbation acceleration
     def _calculate_J2_perturbation(self, r_vec, J2, R_earth):
         x, y, z = r_vec
         r = np.linalg.norm(r_vec)
-        factor = 1.5 * J2 * self.mu_earth * R_earth**2 / r**5   
+    
+        # Verify units: μ_earth in m³/s², R_earth in m, r in m
+        factor = 1.5 * J2 * self.mu_earth * R_earth**2 / r**5
+    
+        # Add safety check for reasonable magnitude
+        gravity_accel = self.mu_earth / r**2
+        j2_accel_magnitude = abs(factor * r)  # Approximate magnitude
+    
+        if j2_accel_magnitude > 0.1 * gravity_accel:  # Should be < 10% of gravity
+            print(f"WARNING: J2 perturbation too large: {j2_accel_magnitude/gravity_accel*100:.1f}% of gravity")
+            return np.zeros(3)  # Disable if unrealistic
+    
         a_x = factor * x * (5 * z**2 / r**2 - 1)
-        a_y = factor * y * (5 * z**2 / r**2 - 1)
+        a_y = factor * y * (5 * z**2 / r**2 - 1) 
         a_z = factor * z * (5 * z**2 / r**2 - 3)
+    
         return np.array([a_x, a_y, a_z])
     
     #Calculate acceleration due to solar radiation pressure
@@ -1910,50 +2481,23 @@ class RealisticOrbitalMechanics:
         if 'area_to_mass' not in params:
             return np.zeros(3)
             
-        #sun position
-        sun_pos = params.get('sun_position', np.zeros(3))
-        #vector from satellite to sun
-        r_sun = sun_pos - r_vec
-        r_sun_mag = np.linalg.norm(r_sun)
-        if r_sun_mag == 0:
-            return np.zeros(3)
-            
-        #Solar radiation pressure at satellite distance
-        P_sr = self.solar_pressure_const * (AU * 1000 / r_sun_mag)**2 / self.c
-        #Shadow function (0 in eclipse, 1 in sunlight)
-        shadow = self._calculate_shadow_function(r_vec, sun_pos, params)
-        #Acceleration - away from sun
-        a_srp = -shadow * P_sr * params['area_to_mass'] * r_sun / r_sun_mag
-        return a_srp
+        # Get Earth position relative to Sun
+        earth_pos = params.get('earth_position', np.array([AU * 1000, 0, 0]))  # 1 AU in meters
     
-    #Calculate eclipse shadow function
-    def _calculate_shadow_function(self, r_sat, r_sun, params):
-        #vector from Earth/Mars to satellite
-        r_sat_mag = np.linalg.norm(r_sat)   
-        #vector from Earth/Mars to Sun
-        r_sun_mag = np.linalg.norm(r_sun)
-        if r_sat_mag == 0 or r_sun_mag == 0:
-            return 1.0 
-        #Angle between satellite and sun as seen from central body
-        cos_angle = np.dot(r_sat, r_sun) / (r_sat_mag * r_sun_mag)
-        
-        # if satellite is on opposite side of Earth/Mars from Sun
-        if cos_angle < 0:
-            #Check if satellite is in umbra
-            central_body = params.get('central_body', 'Earth')
-            if central_body == 'Earth':
-                planet_radius = EARTH_RADIUS * 1000  # meters
-            else:
-                planet_radius = MARS_RADIUS * 1000
-                
-            #Angular radius of planet as seen from satellite
-            sin_planet = planet_radius / r_sat_mag
-            #Angular radius of sun as seen from satellite  
-            sin_sun = SUN_RADIUS * 1000 / r_sun_mag
-            #If planet appears larger than sun, we're in shadow
-            if sin_planet > sin_sun:
-                return 0.0
-        return 1.0 
+        # Satellite position in heliocentric frame
+        sat_heliocentric = earth_pos + r_vec
+    
+        # Distance from Sun (should be ~1 AU)
+        r_sun_mag = np.linalg.norm(sat_heliocentric)
+    
+        # Solar flux at satellite distance
+        solar_flux = self.solar_pressure_const * (AU * 1000 / r_sun_mag)**2
+        P_sr = solar_flux / self.c  # Pressure = flux / speed_of_light
+    
+        # Direction away from Sun
+        sun_direction = sat_heliocentric / r_sun_mag
+    
+        return P_sr * params['area_to_mass'] * sun_direction
     
     #Calculate third-body gravitational perturbation
     def _calculate_third_body_effect(self, r_sat, r_body, mu_body):
@@ -2002,13 +2546,12 @@ class FSO_LinkScheduler:
         }
 
     def complete_handoff(self, satellite_id, success=True, latency=0.1, data_loss=0):
-        """Mark a handoff as complete"""
         if satellite_id in self.scheduled_handoffs:
             self.scheduled_handoffs[satellite_id]['status'] = 'completed' if success else 'failed'
             self.scheduled_handoffs[satellite_id]['latency'] = latency
             self.scheduled_handoffs[satellite_id]['data_loss'] = data_loss
 
-#Enhanced Navigation and coordination engine for controllers with traffic management
+#Navigation and coordination engine for controllers with traffic management
 class NavigationCoordinator:   
     def __init__(self, controller_id):
         self.controller_id = controller_id
@@ -2017,7 +2560,7 @@ class NavigationCoordinator:
         self.last_update_time = 0
         self.relay_ephemeris = {}  #Cached relay position data
         self.satellite_assignments = {}  #sat_id: assigned_relay_id
-        self.traffic_manager = TrafficManager(controller_id)
+        self.traffic_manager = CoordinatedTrafficManager(controller_id)
         self.last_traffic_update = 0
     
     #Update cached relay position and prediction data
@@ -2111,7 +2654,21 @@ class NavigationCoordinator:
             optimal_targets,
             acquisition_windows
         )
+
+    #Enhanced scheduling with inter-controller coordination
+    def perform_coordinated_scheduling(self, satellites_in_region, current_time, global_coordinator):
+        #Generate local traffic analysis
+        traffic_analysis = self.simulate_traffic_demand(satellites_in_region)
     
+        #Create scheduling intention
+        if not hasattr(self, 'traffic_manager'):
+            self.traffic_manager = CoordinatedTrafficManager(self.controller_id)
+        intention = self.traffic_manager.create_scheduling_intention(traffic_analysis, current_time)
+    
+        #Register intention with global coordinator
+        global_coordinator.register_scheduling_intention(self.controller_id, intention)
+        return intention
+
     #Calculate time windows when satellite can acquire relay
     def _calculate_acquisition_windows(self, satellite, relay_id, current_time):
         windows = []   
@@ -2124,7 +2681,7 @@ class NavigationCoordinator:
         return windows
     
     #Coordinate handoffs between relays for satellites
-    def coordinate_handoffs(self, satellites_in_region, current_time):
+    def coordinate_handoffs(self, satellites_in_region,all_satellites, current_time):
         handoff_commands = []   
         for satellite in satellites_in_region:
             #Check if satellite needs handoff
@@ -2146,7 +2703,105 @@ class NavigationCoordinator:
                             'to_relay': new_relay,
                             'handoff_time': handoff_time
                         })
+
+        region_handoffs = self.detect_region_handoffs(satellites_in_region, all_satellites, current_time)
+        handoff_commands.extend(region_handoffs)
+
         return handoff_commands
+
+    #Find which controller should manage this satellite based on proximity and region rules
+    def find_best_controller_for_satellite(self, satellite, all_controllers):
+        best_controller = None
+        min_distance = float('inf')
+        for controller in all_controllers:
+            # Check if satellite is in this controller's region
+            if controller._is_in_controller_region(satellite):
+                distance = np.linalg.norm(satellite.position - controller.position)
+                if distance < min_distance:
+                    min_distance = distance
+                    best_controller = controller.sat_id
+    
+        return best_controller
+
+    #Find which relay this satellite is currently connected to
+    def find_current_relay_connection(self, satellite):
+        if satellite.fso_terminal.current_links:
+            # Get relay connections (assuming relay IDs start with 'R')
+            relay_connections = [target_id for target_id in satellite.fso_terminal.current_links.keys() 
+                           if target_id.startswith('R')]
+            if relay_connections:
+                return relay_connections[0]  # Return first relay connection
+        return None
+
+    #Detect when satellites need handoffs due to region changes
+    def detect_region_handoffs(self, satellites_in_region, all_satellites, current_time):
+        handoff_commands = []
+        # Get all controllers
+        all_controllers = [sat for sat in all_satellites if sat.sat_type == 'controller']
+        if not all_controllers:
+            return handoff_commands
+        # Initialize tracking if first time
+        if not hasattr(self, 'previous_satellite_assignments'):
+            self.previous_satellite_assignments = {}
+            # Initialize with current assignments
+            for satellite in satellites_in_region:
+                self.previous_satellite_assignments[satellite.sat_id] = self.controller_id
+            return handoff_commands
+    
+        for satellite in satellites_in_region:
+            previous_controller = self.previous_satellite_assignments.get(satellite.sat_id, self.controller_id)
+        
+            # Find which controller this satellite should be assigned to now
+            best_controller = self.find_best_controller_for_satellite(satellite, all_controllers)
+        
+            # If satellite should move to a different controller's region
+            if best_controller and best_controller != previous_controller:
+                # Find new optimal relay for this region
+                new_controller_obj = next((c for c in all_controllers if c.sat_id == best_controller), None)
+                if new_controller_obj and hasattr(new_controller_obj, 'navigation_coordinator'):
+                    new_relay = new_controller_obj.navigation_coordinator.select_optimal_relay(
+                        satellite.position, satellite.velocity, current_time
+                    )
+                    # Find current relay connection
+                    current_relay = self.find_current_relay_connection(satellite)
+                    if new_relay and current_relay and new_relay != current_relay:
+                        handoff_time = current_time + 0.05  # Faster handoff for region changes
+                        self.fso_scheduler.plan_handoff(
+                            satellite.sat_id, current_relay, new_relay, handoff_time
+                        )
+                        handoff_commands.append({
+                            'satellite_id': satellite.sat_id,
+                            'from_relay': current_relay,
+                            'to_relay': new_relay,
+                            'handoff_time': handoff_time,
+                            'reason': 'REGION_CHANGE',
+                            'from_controller': previous_controller,
+                            'to_controller': best_controller
+                        })
+                        print(f"    REGION HANDOFF: {satellite.sat_id} moved from {previous_controller} to {best_controller}")
+                        print(f"                    Relay change: {current_relay} -> {new_relay}")
+                    # Update assignment
+                    self.previous_satellite_assignments[satellite.sat_id] = best_controller
+        return handoff_commands
+
+    #Simulate realistic traffic demand for coordination
+    def simulate_traffic_demand(self, satellites_in_region):
+        traffic_demand = {}
+        for satellite in satellites_in_region:
+            #Generate realistic traffic mix
+            traffic_demand[satellite.sat_id] = {
+                'total_data_gb': np.random.uniform(0.5, 8.0),
+                'priority_breakdown': {
+                    'EMERGENCY': {'size_gb': np.random.uniform(0, 0.1) if np.random.random() < 0.05 else 0},
+                    'CRITICAL': {'size_gb': np.random.uniform(0, 1.0) if np.random.random() < 0.15 else 0},
+                    'HIGH': {'size_gb': np.random.uniform(0, 3.0) if np.random.random() < 0.3 else 0},
+                    'NORMAL': {'size_gb': np.random.uniform(1.0, 5.0)},
+                    'LOW': {'size_gb': np.random.uniform(0, 2.0) if np.random.random() < 0.2 else 0}
+                },
+                'deadline_urgency': 1 if np.random.random() < 0.05 else 0,
+                'destinations': {'Ground-Station': 80, 'Data-Center': 20}
+            }
+        return traffic_demand
 
 #FSO terminal that accepts both positioning and traffic instructions
 class FSO_Terminal:
@@ -2182,6 +2837,10 @@ class FSO_Terminal:
         #Adaptive parameters
         self.adaptive_power_level = 1.0  #Power scaling factor
         self.beam_quality_factor = 1.0   #Atmospheric/space conditions
+        self.wavelength = FSO_WAVELENGTH  # 1550e-9
+        self.beam_divergence = FSO_BEAM_DIVERGENCE  # 30e-6
+        self.transmit_power = power
+        self.aperture_size = aperture_size
     
     #Receive navigation update from controller
     def receive_navigation_update(self, nav_update):
@@ -2210,8 +2869,7 @@ class FSO_Terminal:
                         'data_rate': instructions['allocated_data_rate'],
                         'priority': instructions['transmission_priority'],
                         'authorization': instructions['transmission_authorization']
-                    }
-                    
+                    }       
                     self.authorized_transmission_time = instructions['transmission_start_time']
                 else:
                     self.current_transmission_slot = None
@@ -2245,45 +2903,116 @@ class FSO_Terminal:
         print(f"        Priority: {schedule['priority']}")
         return True
 
-    #Calculate FSO link budget between terminals
-    def calculate_link_budget(self, target_terminal, distance):  
-        #Transmitted power - dBm
-        tx_power_dbm = 10 * np.log10(self.transmit_power * 1000)
-        #Free space path loss - dB
-        path_loss_db = 20 * np.log10(distance) + 20 * np.log10(self.wavelength) - 147.55
-        #Geometric loss - due to beam divergence - dB
-        beam_radius_at_target = self.beam_divergence * distance
-        target_aperture_area = np.pi * (target_terminal.aperture_size / 2) ** 2
-        beam_area = np.pi * beam_radius_at_target ** 2
-        geometric_loss_db = -10 * np.log10(target_aperture_area / beam_area)
-        #Enhanced pointing loss with navigation assistance
-        base_pointing_error = np.random.normal(0, self.pointing_accuracy)
-        # Reduce pointing error - recent navigation updates
-        if self.last_navigation_update > 0:
-            navigation_assistance_factor = 0.5  #50% improvement with navigation
-            pointing_error = base_pointing_error * navigation_assistance_factor
-        else:
-            pointing_error = base_pointing_error
-        pointing_loss_db = -12 * (pointing_error / self.beam_divergence) ** 2
-        
-        #Atmospheric loss - only for Earth-based terminals
-        atmospheric_loss = ATMOSPHERIC_LOSS_DB if hasattr(self, 'planet') and self.planet == 'Earth' else 0
-        #Total received power - dBm
-        rx_power_dbm = (tx_power_dbm - path_loss_db - geometric_loss_db - pointing_loss_db - atmospheric_loss)
-        #Convert to linear scale - watts
-        rx_power_watts = 10 ** ((rx_power_dbm - 30) / 10)
-        return {
-            'tx_power_dbm': tx_power_dbm,
-            'rx_power_dbm': rx_power_dbm,
-            'rx_power_watts': rx_power_watts,
-            'path_loss_db': path_loss_db,
-            'geometric_loss_db': geometric_loss_db,
-            'pointing_loss_db': pointing_loss_db,
-            'atmospheric_loss_db': atmospheric_loss,
-            'total_loss_db': path_loss_db + geometric_loss_db + pointing_loss_db + atmospheric_loss,
-            'navigation_assisted': self.last_navigation_update > 0
-        }
+    #Calculate FSO link budget using Majumdar (2005) equations
+    def calculate_link_budget(self, target_terminal, distance):
+        # Get terminal parameters
+        wavelength = self.wavelength  # 1550e-9 m
+        transmit_power = self.transmit_power  # Watts
+        beam_divergence = self.beam_divergence  # Full angle in radians
+        aperture_size = self.aperture_size  # Meters
+        target_aperture = target_terminal.aperture_size  # Meters
     
+        #Transmitter Gain: GT = 16/θT²
+        GT = 16.0 / (beam_divergence ** 2)
+    
+        #Receiver Gain: GR = (πD/λ)² 
+        GR = (np.pi * target_aperture / wavelength) ** 2
+    
+        #Free Space Loss: S = (λ/4πL)²
+        S = (wavelength / (4 * np.pi * distance)) ** 2
+    
+        #Transmitter Efficiency: τT 
+        tau_T = 0.8  # 80% efficiency for space-qualified optics
+    
+        #Receiver Efficiency: τR
+        tau_R = 0.8  # 80% efficiency for space-qualified optics
+    
+        #Atmospheric Transmission: τATM + for space communications: minimal atmospheric effects
+        tau_ATM = 1.0  # No atmosphere in space
+    
+        # PREC = PT × GT × τT × τATM × S × GR × τR
+        received_power = (transmit_power * GT * tau_T * tau_ATM * S * GR * tau_R)
+    
+        # Convert powers to dBm (referenced to 1 mW)
+        if received_power > 0:
+            received_power_dbm = 10 * np.log10(received_power * 1000)
+        else:
+            received_power_dbm = -150  # Very weak signal
+    
+        transmit_power_dbm = 10 * np.log10(transmit_power * 1000)
+    
+        # Convert gains/losses to dB
+        transmitter_gain_db = 10 * np.log10(GT) if GT > 0 else -50
+        receiver_gain_db = 10 * np.log10(GR) if GR > 0 else -50
+        free_space_loss_db = -10 * np.log10(S) if S > 0 else 200
+        atmospheric_loss_db = -10 * np.log10(tau_ATM)
+        transmitter_efficiency_db = 10 * np.log10(tau_T)
+        receiver_efficiency_db = 10 * np.log10(tau_R)
+    
+        # Total system loss (positive number)
+        total_loss_db = (free_space_loss_db + atmospheric_loss_db - 
+                    transmitter_gain_db - receiver_gain_db - 
+                    transmitter_efficiency_db - receiver_efficiency_db)
+    
+        #R = (Pt·τopt·τATM·A)/(π·(θt/2)²·L²·Ep·Nb)
+        photon_energy = (6.626e-34 * 2.998e8) / wavelength  # Ep = hc/λ
+        receiver_area = np.pi * (target_aperture/2)**2
+        photons_per_bit = 100  # Estiamte for space communications
+    
+        tau_opt = tau_T * tau_R  # Combined optical efficiency
+    
+        numerator = transmit_power * tau_opt * tau_ATM * receiver_area
+        denominator = (np.pi * (beam_divergence/2)**2 * distance**2 * 
+                  photon_energy * photons_per_bit)
+    
+        achievable_data_rate = numerator / denominator if denominator > 0 else 0
+        #Determine link quality based on received power
+        if received_power_dbm > -30:
+            link_quality = 0.95  # Excellent
+            quality_text = "EXCELLENT"
+        elif received_power_dbm > -50:
+            link_quality = 0.85  # Good  
+            quality_text = "GOOD"
+        elif received_power_dbm > -70:
+            link_quality = 0.70  # Degraded
+            quality_text = "DEGRADED"
+        elif received_power_dbm > -90:
+            link_quality = 0.50  # Poor
+            quality_text = "POOR"
+        else:
+            link_quality = 0.1   # Minimal
+            quality_text = "MINIMAL"
+    
+        return {
+        'received_power_watts': received_power,
+        'received_power_dbm': received_power_dbm,
+        'transmit_power_dbm': transmit_power_dbm,
+        'link_quality': link_quality,
+        'quality_text': quality_text,
+        'achievable_data_rate_bps': achievable_data_rate,
+        'achievable_data_rate_gbps': achievable_data_rate / 1e9,
+        'transmitter_gain_linear': GT,
+        'receiver_gain_linear': GR, 
+        'free_space_loss_linear': S,
+        'atmospheric_transmission': tau_ATM,
+        'transmitter_efficiency': tau_T,
+        'receiver_efficiency': tau_R,
+        'transmitter_gain_db': transmitter_gain_db,
+        'receiver_gain_db': receiver_gain_db,
+        'free_space_loss_db': free_space_loss_db,
+        'atmospheric_loss_db': atmospheric_loss_db,
+        'transmitter_efficiency_db': transmitter_efficiency_db,
+        'receiver_efficiency_db': receiver_efficiency_db,
+        'total_loss_db': total_loss_db,
+        'distance_km': distance / 1000,
+        'wavelength_nm': wavelength * 1e9,
+        'beam_divergence_urad': beam_divergence * 1e6,
+        'transmitter_aperture_m': aperture_size,
+        'receiver_aperture_m': target_aperture,
+        'navigation_assisted': hasattr(self, 'last_navigation_update') and self.last_navigation_update > 0,
+        'link_feasible': received_power_dbm > -100  # Minimum detectable signal
+        }
+
     #Calculate achievable data rate based on link budget
     def calculate_data_rate(self, link_budget):  
         #Enhanced calculation with navigation assistance bonus
@@ -2339,14 +3068,13 @@ class FSO_Terminal:
                 if np.random.random() < success_probability:
                     # Successful acquisition
                     link_budget = self.calculate_link_budget(target_terminal, distance)
-                    link_performance = self.calculate_data_rate(link_budget)
                     self.current_links[target_terminal.terminal_id] = {
-                        'quality': max(0.5, link_performance['link_quality']),  #Ensure minimum quality
-                        'data_rate': max(1e9, link_performance['data_rate_bps']),  #Minimum 1 Gbps
-                        'snr_db': link_performance['snr_db'],
+                        'quality': link_budget['link_quality'],
+                        'data_rate': link_budget['achievable_data_rate_bps'], 
+                        'snr_db': link_budget['received_power_dbm'] + 90,  # Assume -90 dBm noise floor
                         'established_time': current_time,
                         'link_budget': link_budget,
-                        'navigation_assisted': link_performance['navigation_assisted']
+                        'navigation_assisted': link_budget['navigation_assisted']
                     }
                     
                     self.successful_acquisitions += 1
@@ -2377,7 +3105,7 @@ class FSO_Terminal:
             link_performance = self.calculate_data_rate(link_budget)
             quality_variation = np.random.normal(1.0, 0.05)  # 5% standard deviation
             adjusted_quality = link_performance['link_quality'] * quality_variation
-            adjusted_data_rate = link_performance['data_rate_bps'] * quality_variation
+            adjusted_data_rate = link_budget['achievable_data_rate_bps'] * quality_variation
             #Update link parameters
             self.current_links[target_terminal.terminal_id].update({
                 'quality': max(0, min(1.0, adjusted_quality)),
@@ -2416,7 +3144,7 @@ class FSO_Terminal:
             'transmission_schedule': self.transmission_schedule
         }
 
-#Enhanced Network Architecture with Free Space Optical Communication, Controller Navigation, and Traffic Management
+#Network Architecture with Free Space Optical Communication, Controller Navigation, and Traffic Management
 class FSO_NetworkArchitecture:   
     def __init__(self):
         self.satellites = []
@@ -2425,47 +3153,80 @@ class FSO_NetworkArchitecture:
         self.ephemeris = RealEphemerisData()
         LineOfSightChecker.ephemeris = self.ephemeris
         self.lagrange_calculator = PreciseLagrangePoints(self.ephemeris)
-        #blocking analysis
+    
+        # Blocking analysis
         self.last_blocked_by_sun = 0
         self.last_blocked_by_earth = 0
         self.last_blocked_by_mars = 0
-        #Initialize Earth satellites with FSO
-        for i in range(EARTH_SATS):
-            inclination = 60 if i < EARTH_SATS//2 else 120
-            phase = 360 * i / (EARTH_SATS//2)
-            raan = 360 * (i // (EARTH_SATS//8)) / 8  #distribute across 8 orbital planes
-            sat = EnhancedSatellite(
-                sat_id=f"E{i+1}",
-                planet='Earth',
-                orbit_altitude=EARTH_ORBIT_ALTITUDE,
-                inclination=inclination,
-                phase=phase,
-                sat_type='satellite',
-                color='blue'
-            )
-            self.satellites.append(sat)
-        #Initialize Mars satellites with FSO
+    
+        # Initialize Earth satellites with Walker constellation: 8/2/1
+        print(f"Initializing Earth Walker constellation: {EARTH_SATS}/2/1")
+    
+        # Walker constellation parameters
+        total_satellites = EARTH_SATS  # T = 8
+        planes = 2                     # P = 2  
+        relative_spacing = 1           # F = 1
+        sats_per_plane = total_satellites // planes  # 4 satellites per plane
+    
+        print(f"  {sats_per_plane} satellites per plane, {planes} planes")
+        print(f"  Phase offset between planes: {360 * relative_spacing / total_satellites:.1f}°")
+
+        for plane in range(planes):
+            # Calculate RAAN for this plane (evenly distributed)
+            raan = 360 * plane / planes  # 0°, 180° for 2 planes
+        
+            # Calculate phase offset for this plane (Walker spacing)
+            plane_phase_offset = (360 * relative_spacing * plane / total_satellites) % 360
+        
+            print(f"  Plane {plane + 1}: RAAN = {raan:.1f}°, Phase offset = {plane_phase_offset:.1f}°")
+        
+            for sat_in_plane in range(sats_per_plane):
+                # Satellite index
+                i = plane * sats_per_plane + sat_in_plane
+            
+                # Even spacing within the plane + Walker phase offset
+                intra_plane_spacing = 360 * sat_in_plane / sats_per_plane
+                phase = (intra_plane_spacing + plane_phase_offset) % 360
+            
+                sat = EnhancedSatellite(
+                    sat_id=f"E{i+1}",
+                    planet='Earth',
+                    orbit_altitude=EARTH_ORBIT_ALTITUDE,
+                    inclination=55,  # Good inclination for global coverage
+                    phase=phase,
+                    raan=raan,
+                    sat_type='satellite',
+                    color='blue'
+                )
+                self.satellites.append(sat)
+                print(f"    {sat.sat_id}: phase={phase:.1f}°, RAAN={raan:.1f}°")
+    
+        # Initialize Mars satellites with simple even spacing (4/1/0 pattern)
+        print(f"\nInitializing Mars satellites: {MARS_SATS}/1/0 (simple even spacing)")
         for i in range(MARS_SATS):
-            inclination = 60 if i < MARS_SATS//2 else 120
-            phase = 360 * i / (MARS_SATS//2)
-            raan = 360 * i / MARS_SATS  #Spread across different planes
+            # Perfect 90° spacing for 4 satellites
+            phase = 360 * i / MARS_SATS
+        
             sat = EnhancedSatellite(
                 sat_id=f"M{i+1}",
                 planet='Mars',
                 orbit_altitude=MARS_ORBIT_ALTITUDE,
-                inclination=inclination,
+                inclination=55,
                 phase=phase,
+                raan=0,  # All in same plane
                 sat_type='satellite',
                 color='red'
             )
             self.satellites.append(sat)
-        #Initialize Controllers with enhanced navigation capabilities
-        earth_moon_lagrange_points = ['Earth-Moon-L1', 'Earth-Moon-L2', 'Earth-Moon-L4', 'Earth-Moon-L5']
+            print(f"  {sat.sat_id}: phase={phase:.1f}°")
+
+        #Initialize Controllers with enhanced naviga
+        earth_moon_lagrange_points = ['Earth-Moon-L3', 'Earth-Moon-L4', 'Earth-Moon-L5']
         earth_sun_lagrange_points = ['Earth-Sun-L1', 'Earth-Sun-L2', 'Earth-Sun-L4', 'Earth-Sun-L5']
         mars_sun_lagrange_points = ['Mars-Sun-L1', 'Mars-Sun-L2', 'Mars-Sun-L4', 'Mars-Sun-L5']
-        #Initialize Controllers with enhanced navigation capabilities
-        if EARTH_MOON_CONTROLLERS > 0:
-            earth_moon_lagrange_points = ['Earth-Moon-L1', 'Earth-Moon-L2', 'Earth-Moon-L4', 'Earth-Moon-L5']
+
+        if EARTH_MOON_CONTROLLERS >0:
+            #earth_moon_lagrange_points = ['Earth-Moon-L3', 'Earth-Moon-L4', 'Earth-Moon-L5']
         
             for i, point in enumerate(earth_moon_lagrange_points):
                 point = earth_moon_lagrange_points[i]
@@ -2480,7 +3241,8 @@ class FSO_NetworkArchitecture:
                 color='green'
                 )
                 self.satellites.append(sat)
-        #Initialize Earth-Sun relays
+
+        print("\n=== INITIALIZING EARTH-SUN RELAYS ===")
         for i, point in enumerate(earth_sun_lagrange_points):
             sat = EnhancedSatellite(
                 sat_id=f"ER{i+1}",
@@ -2492,8 +3254,12 @@ class FSO_NetworkArchitecture:
                 lagrange_point=point,
                 color='cyan'
             )
+            sat.position = sat._get_precise_lagrange_position(0)
+            print(f"  {sat.sat_id} ({point}): {np.linalg.norm(sat.position)/1000:.0f} km from origin")
             self.satellites.append(sat)
-        #Initialize Mars-Sun relays
+        
+        # Initialize Mars-Sun relays  
+        print("\n=== INITIALIZING MARS-SUN RELAYS ===")
         for i, point in enumerate(mars_sun_lagrange_points):
             sat = EnhancedSatellite(
                 sat_id=f"MR{i+1}",
@@ -2505,8 +3271,11 @@ class FSO_NetworkArchitecture:
                 lagrange_point=point,
                 color='orange'
             )
+            sat.position = sat._get_precise_lagrange_position(0)
+            print(f"  {sat.sat_id} ({point}): {np.linalg.norm(sat.position)/1000:.0f} km from origin")
             self.satellites.append(sat)
-        #Enhanced metrics for FSO with controller coordination and traffic management
+
+        #metrics for FSO with controller coordination and traffic management
         self.earth_connectivity = 0.0
         self.mars_connectivity = 0.0
         self.total_connectivity = 0.0
@@ -2523,31 +3292,373 @@ class FSO_NetworkArchitecture:
         self.history = []
         self.metrics_collector = ThesisMetricsCollector()
 
-    #Enhanced update with FSO link management, controller coordination, and traffic management
+    #Verify Earth-Moon Lagrange points are correctly positioned
+    def verify_earth_moon_lagrange_fix(self, time):
+        print(f"\n=== EARTH-MOON LAGRANGE VERIFICATION (t={time:.0f}h) ===")
+        earth_pos = self.ephemeris.get_earth_position(time)
+        moon_pos = self.ephemeris.get_moon_position(time)
+        earth_moon_distance = np.linalg.norm(moon_pos - earth_pos)
+        print(f"Earth-Moon distance: {earth_moon_distance:.0f} km")
+        for controller in [s for s in self.satellites if s.sat_type == 'controller']:
+            if 'Earth-Moon' in controller.lagrange_point:
+                dist_from_earth = np.linalg.norm(controller.position - earth_pos)
+                dist_from_moon = np.linalg.norm(controller.position - moon_pos)
+                print(f"{controller.sat_id} ({controller.lagrange_point}):")
+                print(f"  Distance from Earth: {dist_from_earth:.0f} km")
+                print(f"  Distance from Moon: {dist_from_moon:.0f} km")
+                print(f"  Ratio to Earth-Moon distance: {dist_from_earth/earth_moon_distance:.2f}")
+
+    #FIXED: Use satellite orbital angles around Earth, not heliocentric angles
+    def assign_satellites_to_controllers_exclusively(self):
+        controllers = [sat for sat in self.satellites if sat.sat_type == 'controller']
+        earth_sats = [sat for sat in self.satellites if sat.planet == 'Earth']
+        if not controllers:
+            return
+        #Clear existing assignments
+        for controller in controllers:
+            controller.satellites_in_region = []
+        #Calculate orbital angles around Earth (not heliocentric angles)
+        earth_pos = self.ephemeris.get_earth_position(getattr(self, 'current_sim_time', 0))
+    
+        # Assign based on satellite's orbital angle around Earth
+        for earth_sat in earth_sats:
+            # Get satellite position relative to Earth
+            earth_relative_pos = earth_sat.position - earth_pos
+            satellite_orbital_angle = np.arctan2(earth_relative_pos[1], earth_relative_pos[0]) * 180 / np.pi % 360
+            # Find closest controller by angle
+            min_angle_diff = 360
+            assigned_controller = None
+            for controller in controllers:
+                controller_relative_pos = controller.position - earth_pos
+                controller_angle = np.arctan2(controller_relative_pos[1], controller_relative_pos[0]) * 180 / np.pi % 360
+                angle_diff = min(abs(satellite_orbital_angle - controller_angle), 
+                           360 - abs(satellite_orbital_angle - controller_angle))
+                if angle_diff < min_angle_diff:
+                    min_angle_diff = angle_diff
+                    assigned_controller = controller
+            if assigned_controller:
+                assigned_controller.satellites_in_region.append(earth_sat)
+                print(f"  {earth_sat.sat_id}: orbital angle={satellite_orbital_angle:.1f}° -> {assigned_controller.sat_id}")
+    
+    #Track relative motion between controllers and satellites
+    def debug_controller_satellite_angles(self, time):
+        controllers = [s for s in self.satellites if s.sat_type == 'controller']
+        earth_sats = [s for s in self.satellites if s.planet == 'Earth'][:1]  # Just track one satellite
+    
+        print(f"\n  CONTROLLER-SATELLITE RELATIVE MOTION (t={time:.0f}h):")
+        for controller in controllers:
+            for sat in earth_sats:
+                controller_angle = np.arctan2(controller.position[1], controller.position[0]) * 180/np.pi
+                satellite_angle = np.arctan2(sat.position[1], sat.position[0]) * 180/np.pi
+                relative_angle = (satellite_angle - controller_angle) % 360
+                # Also show distances
+                controller_dist = np.linalg.norm(controller.position) / AU
+                satellite_dist = np.linalg.norm(sat.position) / AU
+                print(f"    {controller.sat_id} at {controller_angle:.1f}° ({controller_dist:.3f}AU), "
+                      f"{sat.sat_id} at {satellite_angle:.1f}° ({satellite_dist:.3f}AU) "
+                    f"=> relative: {relative_angle:.1f}°")
+    
+    #Test L4/L5 calculations directly
+    def test_lagrange_calculations_directly(self, time):
+        print(f"\n  DIRECT LAGRANGE CALCULATION TEST (t={time:.0f}h):")
+        earth_pos = self.ephemeris.get_earth_position(time)
+        moon_pos = self.ephemeris.get_moon_position(time)
+        #Calculate what L4 and L5 SHOULD be
+        moon_relative = moon_pos - earth_pos
+        moon_distance = np.linalg.norm(moon_relative)
+        moon_angle = np.arctan2(moon_relative[1], moon_relative[0]) * 180/np.pi
+        print(f"    Moon relative to Earth: distance={moon_distance:.0f}km, angle={moon_angle:.1f}°")
+        #Call L4/L5 methods directly
+        l4_pos = self.lagrange_calculator.earth_moon_l4(time)
+        l5_pos = self.lagrange_calculator.earth_moon_l5(time)
+        #Calculate what we got
+        l4_relative = l4_pos - earth_pos
+        l5_relative = l5_pos - earth_pos
+        l4_distance = np.linalg.norm(l4_relative)
+        l5_distance = np.linalg.norm(l5_relative)
+        l4_angle = np.arctan2(l4_relative[1], l4_relative[0]) * 180/np.pi
+        l5_angle = np.arctan2(l5_relative[1], l5_relative[0]) * 180/np.pi
+        print(f"    L4 calculated: distance={l4_distance:.0f}km, angle={l4_angle:.1f}°")
+        print(f"    L5 calculated: distance={l5_distance:.0f}km, angle={l5_angle:.1f}°")
+        print(f"    Expected L4 angle: {(moon_angle + 60) % 360:.1f}°")
+        print(f"    Expected L5 angle: {(moon_angle - 60) % 360:.1f}°")
+        # Check what the controllers actually have
+        for controller in [s for s in self.satellites if s.sat_type == 'controller']:
+            if 'L4' in controller.lagrange_point:
+                actual_l4_relative = controller.position - earth_pos
+                actual_l4_distance = np.linalg.norm(actual_l4_relative)
+                actual_l4_angle = np.arctan2(actual_l4_relative[1], actual_l4_relative[0]) * 180/np.pi
+                print(f"    Controller {controller.sat_id} ACTUAL: distance={actual_l4_distance:.0f}km, angle={actual_l4_angle:.1f}°")
+            elif 'L5' in controller.lagrange_point:
+                actual_l5_relative = controller.position - earth_pos
+                actual_l5_distance = np.linalg.norm(actual_l5_relative)
+                actual_l5_angle = np.arctan2(actual_l5_relative[1], actual_l5_relative[0]) * 180/np.pi
+                print(f"    Controller {controller.sat_id} ACTUAL: distance={actual_l5_distance:.0f}km, angle={actual_l5_angle:.1f}°")
+
+    #Debug Lagrange point calculations
+    def debug_lagrange_positions(self, time):
+        print(f"\n  LAGRANGE POINT DEBUG (t={time:.0f}h):")   
+        # Get raw ephemeris data
+        earth_pos = self.ephemeris.get_earth_position(time)
+        moon_pos = self.ephemeris.get_moon_position(time)
+        print(f"    Earth position: [{earth_pos[0]/AU:.3f}, {earth_pos[1]/AU:.3f}, {earth_pos[2]/AU:.3f}] AU")
+        print(f"    Moon position: [{moon_pos[0]/AU:.3f}, {moon_pos[1]/AU:.3f}, {moon_pos[2]/AU:.3f}] AU")
+        earth_moon_dist = np.linalg.norm(moon_pos - earth_pos)
+        print(f"    Earth-Moon distance: {earth_moon_dist:.0f} km (expected: ~384,400 km)")
+        # Check controller positions
+        for controller in [s for s in self.satellites if s.sat_type == 'controller']:
+            pos = controller.position
+            dist_from_earth = np.linalg.norm(pos - earth_pos)
+            print(f"    {controller.sat_id} ({controller.lagrange_point}): {dist_from_earth:.0f} km from Earth")
+        print(f"\n  LAGRANGE ANGULAR DISTRIBUTION (t={time:.0f}h):")
+        earth_pos = self.ephemeris.get_earth_position(time)
+        for controller in [s for s in self.satellites if s.sat_type == 'controller']:
+            # Calculate angle from Sun to controller
+            controller_angle = np.arctan2(controller.position[1], controller.position[0]) * 180/np.pi
+            # Calculate angle from Sun to Earth  
+            earth_angle = np.arctan2(earth_pos[1], earth_pos[0]) * 180/np.pi
+            # Relative angle from Earth
+            relative_angle = (controller_angle - earth_angle) % 360
+            print(f"    {controller.sat_id}: {relative_angle:.1f}° from Earth direction")
+
+    #Debug satellite initial positions after creation but before any updates
+    def debug_initial_positions(self):
+        print("\n=== INITIAL POSITION DEBUG (Before any orbital updates) ===")
+        earth_sats = [sat for sat in self.satellites if sat.planet == 'Earth']
+        for sat in earth_sats:
+            # Calculate what the position SHOULD be based on Walker parameters
+            orbit_radius = EARTH_RADIUS + sat.orbit_altitude  # km
+            expected_angle = sat.phase * 180 / np.pi  # Convert to degrees
+            #Calculate actual position angle
+            if np.linalg.norm(sat.position) > 0:
+                actual_angle = np.arctan2(sat.position[1], sat.position[0]) * 180 / np.pi
+                actual_angle = actual_angle % 360
+                actual_radius = np.linalg.norm(sat.position)
+            else:
+                actual_angle = 0
+                actual_radius = 0
+            print(f"{sat.sat_id}:")
+            print(f"  Expected: phase={expected_angle:.1f}°, radius={orbit_radius:.0f}km")
+            print(f"  Actual: angle={actual_angle:.1f}°, radius={actual_radius:.0f}km")
+            print(f"  RAAN: {sat.raan * 180 / np.pi:.1f}°")
+            print(f"  Raw position: [{sat.position[0]:.0f}, {sat.position[1]:.0f}, {sat.position[2]:.0f}]")
+
+    #Debug a single orbital integration step
+    def debug_orbital_integration_step(self, sat, time, dt):
+        if sat.planet != 'Earth':
+            return   
+        print(f"\n--- Debugging orbital step for {sat.sat_id} ---")
+        # Store initial state
+        initial_pos = sat.position.copy()
+        initial_vel = sat.velocity.copy()
+        initial_angle = np.arctan2(initial_pos[1], initial_pos[0]) * 180 / np.pi
+        print(f"BEFORE integration:")
+        print(f"  Position: [{initial_pos[0]:.0f}, {initial_pos[1]:.0f}, {initial_pos[2]:.0f}]")
+        print(f"  Velocity: [{initial_vel[0]:.3f}, {initial_vel[1]:.3f}, {initial_vel[2]:.3f}]")
+        print(f"  Angle: {initial_angle:.1f}°")
+        # Check if velocity is reasonable for circular orbit
+        orbital_speed = np.sqrt(398600.4418e9 / (np.linalg.norm(initial_pos) * 1000))  # m/s
+        actual_speed = np.linalg.norm(initial_vel) * 1000  # convert km/s to m/s
+        print(f"  Expected orbital speed: {orbital_speed:.0f} m/s")
+        print(f"  Actual speed: {actual_speed:.0f} m/s")
+        # Perform the integration step
+        state = np.concatenate([initial_pos * 1000, initial_vel * 1000])  # Convert to meters
+        params = {
+            'central_body': sat.planet,
+            'area_to_mass': 20.0 / 1500.0,
+            'sun_position': np.array([0, 0, 0]),
+            'moon_position': self.ephemeris.get_moon_position(time) * 1000
+        }
+        t_span = [0, dt * 3600]  # Convert hours to seconds
+        # Debug the forces at initial state
+        forces = sat.orbital_mechanics.propagate_orbit_with_perturbations(state, 0, params)
+        acceleration = forces[3:]  # acceleration part
+        print(f"  Total acceleration: [{acceleration[0]:.6f}, {acceleration[1]:.6f}, {acceleration[2]:.6f}] m/s²")
+        # Check if gravity dominates
+        r_vec = state[:3]
+        r = np.linalg.norm(r_vec)
+        gravity_accel = -sat.orbital_mechanics.mu_earth / r**3 * r_vec
+        print(f"  Gravity acceleration: [{gravity_accel[0]:.6f}, {gravity_accel[1]:.6f}, {gravity_accel[2]:.6f}] m/s²")
+        # Ratio of total to gravity
+        gravity_mag = np.linalg.norm(gravity_accel)
+        total_mag = np.linalg.norm(acceleration)
+        print(f"  Perturbation ratio: {(total_mag - gravity_mag) / gravity_mag * 100:.2f}%")
+
+    #Track Walker constellation drift over several time steps
+    def debug_walker_drift(self, time_steps_to_check=5):
+        print(f"\n=== WALKER CONSTELLATION DRIFT ANALYSIS ===")
+        earth_sats = [sat for sat in self.satellites if sat.planet == 'Earth']
+        # Store initial state
+        initial_angles = {}
+        for sat in earth_sats:
+            angle = np.arctan2(sat.position[1], sat.position[0]) * 180 / np.pi
+            initial_angles[sat.sat_id] = angle % 360
+        print("Initial angles:")
+        for sat_id, angle in initial_angles.items():
+            print(f"  {sat_id}: {angle:.1f}°")
+        # Check relative spacing
+        angles = list(initial_angles.values())
+        angles.sort()
+        spacings = []
+        for i in range(len(angles)):
+            next_angle = angles[(i + 1) % len(angles)]
+            spacing = (next_angle - angles[i]) % 360
+            spacings.append(spacing)
+        print(f"Initial spacings: {[f'{s:.1f}°' for s in spacings]}")
+        print(f"Spacing std dev: {np.std(spacings):.2f}°")
+        print(f"Expected spacing: {360 / len(earth_sats):.1f}°")
+        return initial_angles, spacings
+
+    #Add this method to FSO_NetworkArchitecture to debug satellite positions
+    def debug_satellite_positions(self):
+        print("\n=== SATELLITE POSITION DEBUG ===")
+        earth_sats = [sat for sat in self.satellites if sat.planet == 'Earth']
+        for sat in earth_sats:
+            # Calculate angle from position
+            angle_rad = np.arctan2(sat.position[1], sat.position[0])
+            angle_deg = (angle_rad * 180 / np.pi) % 360
+            # Show both phase and calculated position
+            phase_deg = (sat.phase * 180 / np.pi) % 360
+            print(f"{sat.sat_id}: position=({sat.position[0]:.0f}, {sat.position[1]:.0f})")
+            print(f"  Phase from init: {phase_deg:.1f}°")
+            print(f"  Angle from position: {angle_deg:.1f}°")
+            print(f"  RAAN: {(sat.raan * 180 / np.pi):.1f}°")
+
+    #Monitor and report controller handoffs during simulation
+    def monitor_controller_handoffs(self, time_step):
+        controllers = [sat for sat in self.satellites if sat.sat_type == 'controller']
+        earth_sats = [sat for sat in self.satellites if sat.planet == 'Earth']
+        # Track current assignments
+        current_assignments = {}
+        for earth_sat in earth_sats:
+            assigned_controller = None
+            for controller in controllers:
+                if controller._is_in_controller_region(earth_sat):
+                    assigned_controller = controller.sat_id
+                    break
+            current_assignments[earth_sat.sat_id] = assigned_controller
+        # Compare with previous assignments
+        if hasattr(self, 'previous_assignments'):
+            handoffs = []
+            for sat_id, current_controller in current_assignments.items():
+                previous_controller = self.previous_assignments.get(sat_id)
+                if previous_controller and current_controller and previous_controller != current_controller:
+                    handoffs.append({
+                        'satellite': sat_id,
+                        'from': previous_controller,
+                        'to': current_controller
+                    })
+            if handoffs:
+                print(f"  HANDOFFS at t={time_step}h:")
+                for handoff in handoffs:
+                    print(f"    {handoff['satellite']}: {handoff['from']} → {handoff['to']}")
+        # Store current assignments for next time
+        self.previous_assignments = current_assignments
+        return current_assignments  
+
+    #Simple test without detailed output
+    def test_controller_assignments(self):
+        controllers = [sat for sat in self.satellites if sat.sat_type == 'controller']
+        earth_sats = [sat for sat in self.satellites if sat.planet == 'Earth']
+        print("\nController Assignment Summary:")
+        for controller in controllers:
+            assigned = [sat.sat_id for sat in earth_sats if controller._is_in_controller_region(sat)]
+            print(f"  {controller.sat_id}: {len(assigned)} satellites {assigned}")
+        return controllers
+    
+    #Verify the Walker constellation implementation
+    def verify_walker_constellation(self):
+        earth_sats = [sat for sat in self.satellites if sat.planet == 'Earth']
+        mars_sats = [sat for sat in self.satellites if sat.planet == 'Mars']
+        print("\n" + "="*60)
+        print("WALKER CONSTELLATION VERIFICATION")
+        print("="*60)
+        # Group Earth satellites by orbital plane (RAAN)
+        planes = {}
+        for sat in earth_sats:
+            raan = sat.raan * 180 / np.pi  # Convert to degrees
+            raan_key = round(raan, 1)  # Round to nearest 0.1°
+            if raan_key not in planes:
+                planes[raan_key] = []
+            planes[raan_key].append(sat)
+        print(f"Earth satellites distributed across {len(planes)} planes:")
+        for raan, sats_in_plane in sorted(planes.items()):
+            print(f"\n  Plane RAAN = {raan}°:")
+            phases = []
+            for sat in sats_in_plane:
+                phase_deg = sat.phase * 180 / np.pi  # Convert to degrees
+                phases.append(phase_deg)
+                print(f"    {sat.sat_id}: phase = {phase_deg:.1f}°")
+            # Check spacing within plane
+            phases.sort()
+            spacings = []
+            for i in range(len(phases)):
+                next_phase = phases[(i + 1) % len(phases)]
+                spacing = (next_phase - phases[i]) % 360
+                spacings.append(spacing)
+            avg_spacing = np.mean(spacings)
+            spacing_std = np.std(spacings)
+            print(f"    Intra-plane spacing: {avg_spacing:.1f}° ± {spacing_std:.2f}°")
+        # Verify Walker pattern properties
+        print(f"\nWalker Pattern Verification:")
+        # Check if satellites are distributed optimally
+        all_phases = [sat.phase * 180 / np.pi for sat in earth_sats]
+        all_phases.sort()
+        # Calculate minimum separation between any two satellites
+        min_separation = 360
+        for i in range(len(all_phases)):
+            for j in range(i + 1, len(all_phases)):
+                sep = min(abs(all_phases[i] - all_phases[j]), 
+                         360 - abs(all_phases[i] - all_phases[j]))
+                min_separation = min(min_separation, sep)
+        print(f"  Minimum satellite separation: {min_separation:.1f}°")
+        print(f"  Theoretical optimal separation: {360 / len(earth_sats):.1f}°")
+        # Check Mars satellites
+        print(f"\nMars satellites verification:")
+        mars_phases = [sat.phase * 180 / np.pi for sat in mars_sats]
+        mars_phases.sort()
+        mars_spacings = []
+        for i in range(len(mars_phases)):
+            next_phase = mars_phases[(i + 1) % len(mars_phases)]
+            spacing = (next_phase - mars_phases[i]) % 360
+            mars_spacings.append(spacing)
+        print(f"  Phases: {[f'{p:.1f}°' for p in mars_phases]}")
+        print(f"  Spacings: {[f'{s:.1f}°' for s in mars_spacings]}")
+        print(f"  Spacing uniformity: {np.std(mars_spacings):.2f}° std dev")
+
+    #Update with FSO link management, controller coordination, and traffic management
     def update(self, time, ticks):   
         print(f"  Updating {len(self.satellites)} satellites")
+    
         #Update satellite positions and velocities
         for sat in self.satellites:
-                sat.update_position_with_orbital_perturbations(time, ticks, dt=SIM_STEP)
-        print(f"  Performing controller coordination with traffic management")
-        #Perform controller coordination first
+            sat.update_position_with_orbital_perturbations(time, ticks, dt=SIM_STEP)
+
+        #Store current simulation time for coordinate conversions
+        self.current_sim_time = time
+        self.assign_satellites_to_controllers_exclusively()
+
+        if time < 25:  # Only debug in first few steps
+            self.debug_controller_satellite_angles(time)
+    
+        #Perform inter-controller coordination every hour
+        if int(time) % 1 == 0 and time > 0:  # Every hour after start
+            print(f"  === INTER-CONTROLLER COORDINATION PHASE ===")
+            self.coordinate_inter_controller_scheduling(time)
+            print(f"  === COORDINATION COMPLETE ===")
+    
+        print(f"  Performing individual controller coordination")
+        # Individual controller coordination
         controllers = [sat for sat in self.satellites if sat.sat_type == 'controller']
         for controller in controllers:
             controller.perform_controller_coordination(self.satellites, time)
-        print(f"  Attempting FSO link establishments with traffic coordination")
-        # Update FSO links for all satellites
-        link_attempts = 0
-        coordinated_transmissions = 0
+        print(f"  Attempting FSO link establishments with coordination")
+        # Update FSO links - now with coordination awareness
         for sat in self.satellites:
-            #Check for coordinated transmissions
-            if hasattr(sat.fso_terminal, 'is_authorized_to_transmit') and sat.fso_terminal.is_authorized_to_transmit(time):
-                coordinated_transmissions += 1
             sat.update_fso_links(time, self.satellites)
-            link_attempts += sat.fso_terminal.total_acquisition_attempts
-        print(f"  Total FSO acquisition attempts: {link_attempts}, Coordinated transmissions: {coordinated_transmissions}")
-        #Update network connections using FSO links
+        # Update network connections using FSO links
         self._update_fso_connections()
-        #Analyze connectivity and FSO performance
+        # Analyze connectivity and performance
         self._analyze_connectivity()
         self._analyze_fso_performance()
         self._analyze_optical_links()
@@ -2578,7 +3689,7 @@ class FSO_NetworkArchitecture:
                         sat.connections.append(target_id)
                         #Calculate enhanced latency including FSO processing delays
                         distance_km = np.linalg.norm(sat.position - target_sat.position)
-                        optical_latency = distance_km / 299792.458  #Speed of light in km/ms
+                        optical_latency = distance_km / 299792.458  #Speed of light in km/s
                         processing_delay = 0.1  #FSO processing delay in ms
                         #Navigation assistance reduces latency
                         if link_info.get('navigation_assisted', False):
@@ -2653,6 +3764,76 @@ class FSO_NetworkArchitecture:
         self.last_blocked_by_earth = blocked_by_earth
         self.last_blocked_by_mars = blocked_by_mars
 
+    #Perform network-wide scheduling coordination
+    def coordinate_inter_controller_scheduling(self, current_time):
+        #Create global coordinator if not exists
+        if not hasattr(self, 'global_coordinator'):
+            self.global_coordinator = InterControllerCoordinator()
+        coordinator = self.global_coordinator
+        controllers = [sat for sat in self.satellites if sat.sat_type == 'controller']
+        print(f"  Starting inter-controller coordination with {len(controllers)} controllers")
+        # Collect intentions from all controllers
+        coordinator.scheduling_intentions.clear()
+        intentions_collected = 0
+        for controller in controllers:
+            if hasattr(controller, 'navigation_coordinator') and hasattr(controller, 'satellites_in_region'):
+                if len(controller.satellites_in_region) > 0:
+                    intention = controller.navigation_coordinator.perform_coordinated_scheduling(
+                        controller.satellites_in_region, current_time, coordinator
+                    )
+                    intentions_collected += 1
+        print(f"    Collected {intentions_collected} scheduling intentions")
+        if intentions_collected == 0:
+            return coordinator
+        # Detect conflicts
+        conflicts = coordinator.detect_conflicts()
+        print(f"    Detected {len(conflicts)} scheduling conflicts")
+        if conflicts:
+            for conflict in conflicts:
+                print(f"      Relay {conflict['relay_id']}: {conflict['demand']} demand > {conflict['capacity']} capacity")
+                print(f"        Competing controllers: {conflict['competing_controllers']}")
+    
+        # Resolve conflicts and generate consensus
+        if conflicts:
+            resolutions = coordinator.resolve_conflicts(conflicts)
+            consensus_schedule, controller_updates = coordinator.generate_consensus_schedule(resolutions)
+            print(f"    Generated consensus schedule for {len(resolutions)} relays")
+            #Apply consensus to each controller
+            for controller in controllers:
+                controller_id = controller.sat_id
+                if controller_id in controller_updates:
+                    updates = controller_updates[controller_id]
+                    if hasattr(controller, 'navigation_coordinator') and hasattr(controller.navigation_coordinator, 'traffic_manager'):
+                        approved, rejected = controller.navigation_coordinator.traffic_manager.apply_consensus_schedule(
+                            updates, current_time
+                        )
+                        print(f"      {controller_id}: {approved} approved, {rejected} rejected")
+        else:
+            print(f"    No conflicts detected - all assignments approved")
+            # Apply all assignments without conflicts
+            for controller in controllers:
+                if hasattr(controller, 'navigation_coordinator') and hasattr(controller.navigation_coordinator, 'traffic_manager'):
+                    traffic_mgr = controller.navigation_coordinator.traffic_manager
+                    if hasattr(traffic_mgr, 'current_intention') and traffic_mgr.current_intention:
+                        # Auto-approve all assignments
+                        auto_approved = {
+                            'approved': [
+                                {**assignment, 'controller_id': controller.sat_id} 
+                                for assignment in traffic_mgr.current_intention.proposed_assignments
+                            ],
+                            'rejected': []
+                        }
+                        traffic_mgr.apply_consensus_schedule(auto_approved, current_time)
+        print(f"    Controller region assignments:")
+        for controller in controllers:
+            region_size = len(getattr(controller, 'satellites_in_region', []))
+            if region_size > 0:
+                satellite_ids = [s.sat_id for s in controller.satellites_in_region]
+                print(f"      {controller.sat_id} ({controller.lagrange_point}): {region_size} satellites {satellite_ids}")
+            else:
+                print(f"      {controller.sat_id} ({controller.lagrange_point}): 0 satellites")
+        return coordinator
+
     #Connectivity analysis that tests all satellites
     def _analyze_connectivity(self):
         earth_sats = [sat for sat in self.satellites if sat.planet == 'Earth']
@@ -2664,8 +3845,7 @@ class FSO_NetworkArchitecture:
         earth_connected = set()
         mars_connected = set()
         total_latency = 0
-        path_count = 0
-    
+        path_count = 0    
         #Test every Mars satellite against at least one Earth satellite
         for mars_sat in mars_sats:
             found_path_to_earth = False
@@ -2812,18 +3992,18 @@ class FSO_NetworkArchitecture:
                 target_sat = next((s for s in self.satellites if s.sat_id == target_id), None) 
                 if target_sat:
                     is_interplanetary = False
-                    #1: Check if it's between Earth-Sun and Mars-Sun relays
+                    #Check if it's between Earth-Sun and Mars-Sun relays
                     if (sat in earth_sun_relays and target_sat in mars_sun_relays) or \
                        (sat in mars_sun_relays and target_sat in earth_sun_relays):
                         is_interplanetary = True
                 
-                    #2: Check by distance (backup method)
+                    #Check by distance (backup method)
                     if not is_interplanetary:
                         distance_km = np.linalg.norm(sat.position - target_sat.position)
                         #If distance > 1 AU - likely interplanetary
                         if distance_km > 149597870.7:
                             is_interplanetary = True
-                    #3: Check if one satellite is in Earth system, other in Mars system
+                    #Check if one satellite is in Earth system, other in Mars system
                     if not is_interplanetary:
                         earth_system_sat = (sat.planet == 'Earth' or 
                                           (sat.sat_type in ['controller', 'relay'] and 'Earth' in str(sat.lagrange_point)))
@@ -3684,6 +4864,11 @@ def run_fso_network_simulation():
     sys.stdout = open(output_filename, 'w')   
     
     network = FSO_NetworkArchitecture()
+    network.debug_initial_positions()
+    initial_walker_state = network.debug_walker_drift()
+    network.verify_walker_constellation()
+    network.test_controller_assignments()
+
     start_time = dt.datetime(2025, 5, 3, 12, 0, 0)
     time_points = np.arange(0, SIM_DURATION, SIM_STEP)
     print(f"\nENHANCED FREE SPACE OPTICAL INTERPLANETARY NETWORK SIMULATION")
@@ -3693,18 +4878,27 @@ def run_fso_network_simulation():
     print(f"   Relays: {EARTH_SUN_RELAYS} Earth-Sun, {MARS_SUN_RELAYS} Mars-Sun")
     print(f"   Duration: {SIM_DURATION} hours, Step: {SIM_STEP} hours")
     print(f"{'='*60}\n")
-    #Test if network maintains connectivity during conjunction
-    conjunction_connectivity = test_solar_conjunction(network)
-    if conjunction_connectivity:
-        print("\nSUCCESS: Network maintains Earth-Mars connectivity during solar conjunction")
-    else:
-        print("\nFAILURE: Network loses Earth-Mars connectivity during solar conjunction")
+
     for i, sim_time in enumerate(time_points):
+        if i == 0:
+            print("\n=== DEBUGGING FIRST ORBITAL UPDATE ===")
+            earth_sats = [s for s in network.satellites if s.planet == 'Earth']
+            for sat in earth_sats[:3]:  # Debug first 3 satellites
+                network.debug_orbital_integration_step(sat, sim_time, SIM_STEP)
         current_time = start_time + dt.timedelta(hours=sim_time)
         ticks = spt.Ticktock([current_time.isoformat()])
         print(f"Time Step {i+1}/{len(time_points)}: {current_time.strftime('%Y-%m-%d %H:%M')} (t={sim_time:.1f}h)") 
         #Update the network
         network.update(sim_time, ticks)
+
+        if i % 5 == 0:
+            assignments = network.monitor_controller_handoffs(sim_time)
+            network.debug_controller_satellite_angles(sim_time)
+            network.debug_lagrange_positions(sim_time) 
+            network.test_lagrange_calculations_directly(sim_time) 
+            network.verify_earth_moon_lagrange_fix(sim_time)
+        if i == 5:  # After a few steps
+            network.debug_satellite_positions()
         #Get current stats
         stats = network.get_connectivity_stats()
         fso_stats = stats['fso_performance']
@@ -3719,7 +4913,12 @@ def run_fso_network_simulation():
         print(f"  Controllers: {coordination_stats.get('active_controllers', 0)}/{coordination_stats.get('total_controllers', 0)} active, {coordination_stats.get('coordination_coverage_percentage', 0):.1f}% coverage")
         print(f"  Traffic Mgmt: {traffic_stats.get('satellites_with_traffic_schedule', 0)} scheduled, {traffic_stats.get('authorized_transmissions', 0)} authorized")
         print(f"\n")
-    #Run debugging tests
+    #Test if network maintains connectivity during conjunction
+    conjunction_connectivity = test_solar_conjunction(network)
+    if conjunction_connectivity:
+        print("\nSUCCESS: Network maintains Earth-Mars connectivity during solar conjunction")
+    else:
+        print("\nFAILURE: Network loses Earth-Mars connectivity during solar conjunction")
     print("\n" + "="*60)
     print("RUNNING NETWORK DIAGNOSTICS")
     print("="*60)

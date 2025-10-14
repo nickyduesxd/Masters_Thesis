@@ -1,0 +1,5 @@
+numpy>=1.21.0
+networkx>=2.6.0
+scipy>=1.7.0
+astropy>=5.0.0
+spacepy>=0.2.2

@@ -1,0 +1,5 @@
+# Git repository metadata
+.git/
+
+# Work directory
+work/
