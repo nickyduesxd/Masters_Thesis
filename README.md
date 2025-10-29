@@ -17,7 +17,7 @@ This code implements the network architecture described in the thesis:
 - Solar conjunction resilience through Lagrange point relay positioning
 - Controller-coordinated navigation for improved link acquisition
 - Dynamic traffic management for optimal bandwidth utilization
-- Realistic FSO link budget calculations using Majumdar (2005) equations
+- Realistic FSO link budget calculations
 - Multi-hop routing through strategic relay infrastructure
 
 ## Network Architecture
@@ -244,8 +244,6 @@ The simulation includes four critical validation tests (Section 4.2 of thesis):
 
 ### FSO Link Budget
 
-Based on Majumdar (2005):
-
 - Transmitter gain: G<sub>T</sub> = 16/θ<sub>T</sub>²
 - Receiver gain: G<sub>R</sub> = (πD/λ)²
 - Free space loss: S = (λ/4πL)²
@@ -350,15 +348,6 @@ For a properly configured network:
 - **Queue management:** Effective scheduling
 
 ## References
-
-### Key Publications
-
-1. **Majumdar, A. K.** (2005). "Free-space laser communication performance in the atmospheric channel." *Journal of Optical and Fiber Communications Reports*.
-
-2. **Walker, J. G.** (1984). "Satellite constellations." *Journal of the British Interplanetary Society*.
-
-3. **JPL Planetary and Lunar Ephemerides**  
-   https://ssd.jpl.nasa.gov/planets/eph_export.html
 
 ## Contact and Support
 
