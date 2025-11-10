@@ -314,8 +314,8 @@ SIM_STEP = 0.5       # Larger time steps
 
 **Solution:** The simulation is computationally intensive. Expected runtime:
 
-- **Full simulation** (20,000 hours): 2-4 hours
-- **Test simulation** (1,000 hours): 10-20 minutes
+- **Full simulation** (20,000 hours): 2-3 days
+- **Test simulation** (1,000 hours): 1-2 hours
 
 ## Expected Results
 
